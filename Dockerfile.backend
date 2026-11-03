@@ -1,0 +1,75 @@
+# ==============================================================================
+# Backend API — Multi-stage build
+# Python 3.12 slim + Pipecat WebRTC extras
+# ==============================================================================
+
+# ── Stage 1: dependency builder ──────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+# System deps needed to compile audio/numpy/chromadb wheels
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    libffi-dev \
+    libssl-dev \
+    portaudio19-dev \
+    libsndfile1 \
+    git \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+# Install all Python dependencies into an isolated prefix so we can copy
+# only the site-packages into the final image
+RUN pip install --upgrade pip wheel \
+  && pip install --prefix=/install --no-cache-dir -r requirements.txt \
+  # Pipecat extras for WebRTC + VAD (Silero) — local-first defaults
+  && pip install --prefix=/install --no-cache-dir \
+       "pipecat-ai[webrtc,silero]==1.12.0"
+
+
+# ── Stage 2: runtime image ────────────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+LABEL org.opencontainers.image.title="Smart-AI-Voice-Agent Backend"
+LABEL org.opencontainers.image.description="FastAPI + Pipecat voice concierge gateway"
+
+# Runtime system libs only (no compilers)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    portaudio19-dev \
+    curl \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy compiled site-packages from builder
+COPY --from=builder /install /usr/local
+
+WORKDIR /app
+
+# Copy application source
+COPY backend/ ./backend/
+COPY backend/config/tenants/ ./backend/config/tenants/
+
+# Persistent data directories (mounted as volumes in compose)
+RUN mkdir -p /app/data/chroma_db
+
+# Non-root user for security
+RUN useradd -m -u 1001 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Expose FastAPI port
+EXPOSE 8000
+
+# Health check — the /health endpoint is always available
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+  CMD curl -fs http://localhost:8000/health || exit 1
+
+# IMPORTANT: --workers 1 — SmallWebRTC transport is in-process stateful.
+# Multiple workers would split session state across processes.
+CMD ["python", "-m", "uvicorn", "backend.api.app:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--log-level", "info"]
