@@ -54,7 +54,7 @@ export function useVoiceSession({ tenantId, persona, onServerEvent }: UseVoiceSe
   const onServerEventRef = useRef(onServerEvent);
   onServerEventRef.current = onServerEvent;
 
-  const disconnect = useCallback(() => {
+  const teardownTransport = useCallback(() => {
     dataChannelRef.current?.close();
     dataChannelRef.current = null;
     peerConnectionRef.current?.close();
@@ -65,8 +65,12 @@ export function useVoiceSession({ tenantId, persona, onServerEvent }: UseVoiceSe
     pcIdRef.current = null;
     if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
     setMicrophoneStream(null);
-    setStatus('ended');
   }, []);
+
+  const disconnect = useCallback(() => {
+    teardownTransport();
+    setStatus('ended');
+  }, [teardownTransport]);
 
   const sendCandidates = useCallback(async (candidates: IceCandidatePayload[]) => {
     const pcId = pcIdRef.current;
@@ -84,7 +88,21 @@ export function useVoiceSession({ tenantId, persona, onServerEvent }: UseVoiceSe
   }, []);
 
   const connect = useCallback(async () => {
-    if (peerConnectionRef.current) return;
+    const existingPeer = peerConnectionRef.current;
+    if (existingPeer) {
+      // Only a still-establishing or fully healthy session owns the session
+      // slot. A failed/closed/disconnected peer, or a live peer whose visual
+      // DataChannel has died, is torn down so reconnecting actually works
+      // instead of silently no-oping.
+      const peerState = existingPeer.connectionState;
+      const channelState = dataChannelRef.current?.readyState;
+      const establishing =
+        (peerState === 'new' || peerState === 'connecting') &&
+        (channelState === 'connecting' || channelState === 'open');
+      const healthy = peerState === 'connected' && channelState === 'open';
+      if (establishing || healthy) return;
+      teardownTransport();
+    }
     setErrorMessage(null);
     setStatus('requesting-permission');
     try {
@@ -109,12 +127,30 @@ export function useVoiceSession({ tenantId, persona, onServerEvent }: UseVoiceSe
       const dataChannel = peerConnection.createDataChannel('omnivox-ui-bus', { ordered: true });
       dataChannelRef.current = dataChannel;
 
-      dataChannel.onopen = () => setStatus('connected');
-      dataChannel.onclose = () => {
-        if (peerConnection.connectionState === 'connected') setStatus('visual-unavailable');
+      dataChannel.onopen = () => {
+        if (peerConnectionRef.current !== peerConnection) return;
+        setStatus('connected');
       };
-      dataChannel.onerror = () => setErrorMessage('The visual conversation channel encountered a problem.');
+      dataChannel.onclose = () => {
+        if (peerConnectionRef.current !== peerConnection) return;
+        const peerState = peerConnection.connectionState;
+        if (peerState === 'connected') {
+          setStatus('visual-unavailable');
+          return;
+        }
+        if (peerState === 'failed') {
+          setStatus('error');
+          setErrorMessage('The voice connection failed. Please reconnect.');
+          return;
+        }
+        setStatus('ended');
+      };
+      dataChannel.onerror = () => {
+        if (peerConnectionRef.current !== peerConnection) return;
+        setErrorMessage('The visual conversation channel encountered a problem.');
+      };
       dataChannel.onmessage = (messageEvent) => {
+        if (peerConnectionRef.current !== peerConnection) return;
         const raw = safelyParseJson(messageEvent.data);
         const event = parseServerUiEvent(raw);
         if (event) onServerEventRef.current(event);
@@ -123,11 +159,18 @@ export function useVoiceSession({ tenantId, persona, onServerEvent }: UseVoiceSe
         if (remoteAudioRef.current) remoteAudioRef.current.srcObject = event.streams[0] ?? new MediaStream([event.track]);
       };
       peerConnection.onconnectionstatechange = () => {
-        if (peerConnection.connectionState === 'failed') {
+        if (peerConnectionRef.current !== peerConnection) return;
+        const peerState = peerConnection.connectionState;
+        if (peerState === 'failed') {
           setStatus('error');
           setErrorMessage('The voice connection failed. Please reconnect.');
+          return;
         }
-        if (peerConnection.connectionState === 'disconnected') setStatus('visual-unavailable');
+        if (peerState === 'closed') {
+          setStatus('ended');
+          return;
+        }
+        if (peerState === 'disconnected') setStatus('visual-unavailable');
       };
       peerConnection.onicecandidate = (event) => {
         const candidate = serializeCandidate(event.candidate);
@@ -152,15 +195,11 @@ export function useVoiceSession({ tenantId, persona, onServerEvent }: UseVoiceSe
       const queuedCandidates = pendingCandidatesRef.current.splice(0);
       await sendCandidates(queuedCandidates);
     } catch (error) {
-      peerConnectionRef.current?.close();
-      peerConnectionRef.current = null;
-      microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
-      microphoneStreamRef.current = null;
-      setMicrophoneStream(null);
+      teardownTransport();
       setStatus('error');
       setErrorMessage(toConnectionMessage(error));
     }
-  }, [persona, sendCandidates, tenantId]);
+  }, [persona, sendCandidates, teardownTransport, tenantId]);
 
   const sendEvent = useCallback((event: ClientUiEvent): boolean => {
     const channel = dataChannelRef.current;

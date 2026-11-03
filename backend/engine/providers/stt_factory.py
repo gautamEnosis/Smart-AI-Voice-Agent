@@ -33,10 +33,17 @@ def create_stt_service(
                 from pipecat.services.whisper import WhisperSTTService
                 return WhisperSTTService(model=app_cfg.faster_whisper_model)
             except ImportError:
-                class FasterWhisperSTTStub:
-                    def __init__(self, model: str):
+                from pipecat.processors.frame_processor import FrameProcessor
+
+                class FasterWhisperSTTStub(FrameProcessor):
+                    def __init__(self, model: str) -> None:
+                        super().__init__()
                         self.model = model
                         self.provider = "faster_whisper"
+
+                    async def process_frame(self, frame: Any, direction: Any) -> None:
+                        await super().process_frame(frame, direction)
+                        await self.push_frame(frame, direction)
 
                     def __repr__(self) -> str:
                         return f"<FasterWhisperSTTStub model={self.model}>"

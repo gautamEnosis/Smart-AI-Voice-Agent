@@ -1,6 +1,7 @@
 """SmallWebRTC session management for the consumer voice surface.
 
-The session manager owns browser signalling and the typed DataChannel bridge.
+The session manager owns browser signalling, the real-time multimodal voice
+pipeline lifecycle, and the typed DataChannel bridge.
 It deliberately treats every client card interaction as conversational context:
 it never invokes a booking, cancellation, or payment tool directly. Those writes
 remain exclusively behind the existing spoken confirmation gate in ``backend.mcp``.
@@ -31,6 +32,7 @@ from backend.api.schemas import (
     VoiceOfferResponse,
 )
 from backend.config.settings import AppSettings, TenantConfig, get_settings, load_tenant_config
+from backend.engine.pipeline import ConsumerVoicePipeline, create_consumer_voice_pipeline
 
 try:
     from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -56,6 +58,8 @@ class ConsumerVoiceSession:
 
     connection: SmallWebRTCConnection
     request_context: ConsumerSessionRequest
+    pipeline: ConsumerVoicePipeline | None = None
+    pipeline_failed: bool = False
     selected_room_id: str | None = None
     last_text_message: str | None = None
     ptt_active: bool = False
@@ -129,10 +133,14 @@ class ConsumerVoiceSessionManager:
         await self._handler.handle_patch_request(patch_request)
 
     async def close(self) -> None:
-        """Disconnect all peer connections during application shutdown."""
+        """Disconnect all peer connections and voice pipelines during application shutdown."""
         await self._handler.close()
         async with self._sessions_lock:
+            active_sessions = list(self._sessions.values())
             self._sessions.clear()
+        for session in active_sessions:
+            if session.pipeline:
+                await session.pipeline.stop()
 
     def _tenant_for(self, tenant_id: str) -> TenantConfig:
         """Resolve the configured local tenant without accepting arbitrary tenancy."""
@@ -150,10 +158,24 @@ class ConsumerVoiceSessionManager:
         context: ConsumerSessionRequest,
         tenant: TenantConfig,
     ) -> None:
-        """Attach lifecycle handlers and queue safe initial state for a connection."""
+        """Attach lifecycle handlers, construct voice pipeline, and queue safe initial state."""
         session = ConsumerVoiceSession(connection=connection, request_context=context)
         async with self._sessions_lock:
             self._sessions[connection.pc_id] = session
+
+        # Attach real-time Pipecat pipeline
+        try:
+            pipeline = await create_consumer_voice_pipeline(
+                connection=connection,
+                tenant=tenant,
+                persona_key=context.persona,
+                settings=self._settings,
+            )
+            session.pipeline = pipeline
+            await pipeline.start()
+        except Exception as exc:
+            session.pipeline_failed = True
+            logger.error("Failed to start voice pipeline for peer %s: %s", connection.pc_id, exc)
 
         @connection.event_handler("app-message")
         async def handle_app_message(
@@ -165,7 +187,9 @@ class ConsumerVoiceSessionManager:
         @connection.event_handler("closed")
         async def handle_closed(active_connection: SmallWebRTCConnection) -> None:
             async with self._sessions_lock:
-                self._sessions.pop(active_connection.pc_id, None)
+                closed_session = self._sessions.pop(active_connection.pc_id, None)
+            if closed_session and closed_session.pipeline:
+                await closed_session.pipeline.stop()
 
         await connection.connect()
         connection.send_app_message(
@@ -176,6 +200,17 @@ class ConsumerVoiceSessionManager:
                 "confirmation_required": True,
             }
         )
+        if session.pipeline_failed:
+            # Anti-stub rule: never present a live agent when the pipeline is down.
+            connection.send_app_message(
+                {
+                    "type": "ui_error",
+                    "message": (
+                        "The voice concierge could not start for this session. "
+                        "Please reconnect to speak with your concierge."
+                    ),
+                }
+            )
 
     async def _handle_app_message(
         self,
@@ -202,21 +237,54 @@ class ConsumerVoiceSessionManager:
 
         async with session.lock:
             session.event_count += 1
-            reply = self._apply_event(session, event)
+            reply = await self._apply_event(session, event)
         connection.send_app_message(reply)
 
     @staticmethod
-    def _apply_event(session: ConsumerVoiceSession, event: ClientUiEvent) -> dict[str, Any]:
-        """Apply a typed interaction without bypassing voice confirmation safeguards."""
+    async def _apply_event(session: ConsumerVoiceSession, event: ClientUiEvent) -> dict[str, Any]:
+        """Apply a typed interaction without bypassing voice confirmation safeguards.
+
+        Screen interactions are honest about delivery: when the live pipeline is
+        unavailable the guest receives a ``ui_error`` instead of an
+        acknowledgement that would falsely claim their input reached the agent.
+        """
         if isinstance(event, ClientTouchOverrideEvent):
+            if session.pipeline_failed:
+                return {
+                    "type": "ui_error",
+                    "message": "The concierge is not accepting screen selections right now. Please reconnect.",
+                }
             session.selected_room_id = event.room_id
+            if session.pipeline:
+                try:
+                    await session.pipeline.inject_touch_override(event.room_id, event.label)
+                except Exception as exc:
+                    logger.warning("Pipeline touch override error: %s", exc)
+                    return {
+                        "type": "ui_error",
+                        "message": "Your selection could not reach the concierge. Please try again.",
+                    }
             return {
                 "type": "selection_acknowledged",
                 "room_id": event.room_id,
                 "message": f"Selection received: {event.label}. Your concierge will confirm the details aloud.",
             }
         if isinstance(event, TextMessageEvent):
+            if session.pipeline_failed:
+                return {
+                    "type": "ui_error",
+                    "message": "The concierge is not accepting messages right now. Please reconnect.",
+                }
             session.last_text_message = event.text
+            if session.pipeline:
+                try:
+                    await session.pipeline.inject_user_text(event.text)
+                except Exception as exc:
+                    logger.warning("Pipeline text injection error: %s", exc)
+                    return {
+                        "type": "ui_error",
+                        "message": "Your message could not reach the concierge. Please try again.",
+                    }
             return {
                 "type": "text_acknowledged",
                 "message": "Your message is ready for the concierge. Booking changes still need spoken confirmation.",
