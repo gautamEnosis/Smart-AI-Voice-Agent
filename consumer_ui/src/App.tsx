@@ -97,7 +97,7 @@ export function App() {
             <span className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-slate-950 to-violet-700 text-sm font-bold text-white shadow-lg">GM</span>
             <div><p className="text-sm font-semibold text-slate-950">{config.tenant_name}</p><p className="text-xs text-slate-500">Private digital concierge</p></div>
           </div>
-          <div className="flex items-center gap-2 text-xs font-medium text-slate-600"><ShieldCheck className="h-4 w-4 text-emerald-600" /> Encrypted browser-to-concierge connection <span className="mx-1 h-1 w-1 rounded-full bg-slate-300" /> <span className="text-slate-400">Powered by OmniVox</span></div>
+          <div className="flex items-center gap-2 text-xs font-medium text-slate-600"><ShieldCheck className="h-4 w-4 text-emerald-600" /> Encrypted browser-to-concierge connection <span className="mx-1 h-1 w-1 rounded-full bg-slate-300" /> <span className="text-slate-400">Powered by Smart-AI-Voice-Agent</span></div>
         </header>}
         <section className={`overflow-hidden rounded-[2rem] border border-white/90 bg-white/70 shadow-ambient backdrop-blur-xl ${embedded ? 'rounded-[1.6rem]' : ''}`}>
           <div className="grid lg:grid-cols-[minmax(0,1.08fr)_minmax(24rem,0.92fr)]">

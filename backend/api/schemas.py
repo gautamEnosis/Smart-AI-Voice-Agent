@@ -39,6 +39,21 @@ class VoiceOfferResponse(StrictSchema):
     type: Literal["answer"]
     pc_id: str = Field(min_length=1, max_length=100)
 
+    @field_validator("sdp", mode="after")
+    @classmethod
+    def _terminate_final_line(cls, value: str) -> str:
+        """Guarantee a line-terminated SDP for strict browser parsers.
+
+        ``StrictSchema`` strips surrounding whitespace, which removes the
+        trailing CRLF that aiortc emits. Chromium then rejects the
+        unterminated final line (``a=setup:active Invalid SDP line``) and the
+        peer connection never establishes, so the terminator is restored
+        after validation.
+        """
+        if value.endswith(("\n", "\r")):
+            return value
+        return value + "\r\n"
+
 
 class IceCandidatePayload(StrictSchema):
     """One gathered browser ICE candidate for trickle ICE negotiation."""
