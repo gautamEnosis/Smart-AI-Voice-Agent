@@ -11,6 +11,7 @@ Built on [Pipecat](https://pipecat.ai) 1.12.0 · FastAPI · React 19 · TypeScri
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
+- [Docker Compose (Recommended)](#docker-compose-recommended)
 - [Quick Start (Local-First, \$0 Compute)](#quick-start-local-first-0-compute)
 - [Running Each Service](#running-each-service)
   - [1 — Backend API Gateway](#1--backend-api-gateway)

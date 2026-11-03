@@ -1,0 +1,59 @@
+# Smart AI Voice Agent — .dockerignore
+# Keeps build contexts lean and prevents secrets leaking into images.
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+pytest-cache-files-*/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+consumer_ui/node_modules/
+admin_panel/node_modules/
+consumer_ui/dist/
+admin_panel/dist/
+.npm/
+
+# Git and IDE
+.git/
+.gitignore
+.cursor/
+.agents/
+.vscode/
+*.code-workspace
+
+# Secrets and local config — NEVER copy .env into an image
+.env
+.env.local
+.env.*.local
+
+# Data and persistence — mounted as volumes at runtime
+data/
+*.db
+*.sqlite
+
+# Planning / documentation that doesn't belong in images
+planning/
+*.md
+!README.md
+
+# Test artefacts
+coverage/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

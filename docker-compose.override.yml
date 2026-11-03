@@ -1,0 +1,39 @@
+# ==============================================================================
+# docker-compose.override.yml — Development overrides
+#
+# This file is automatically merged by Docker Compose when you run
+# `docker compose up` in development. It:
+#   - Mounts backend source for live reload (uvicorn --reload)
+#   - Disables the Ollama health-gate so backend starts instantly
+#     when Ollama is already running on the host
+#
+# For production, explicitly specify only the base file:
+#   docker compose -f docker-compose.yml up
+# ==============================================================================
+
+services:
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: >
+      python -m uvicorn backend.api.app:app
+        --host 0.0.0.0
+        --port 8000
+        --workers 1
+        --reload
+        --log-level debug
+    volumes:
+      # Live-reload: mount entire backend source over the image copy
+      - ./backend:/app/backend:ro
+      - ./backend/config/tenants:/app/backend/config/tenants:ro
+      - backend_data:/app/data
+    environment:
+      DEBUG: "true"
+      LOG_LEVEL: DEBUG
+    # In dev, allow backend to start without waiting for Ollama health
+    # (useful when Ollama is already running on the host, not in Docker)
+    depends_on:
+      ollama:
+        condition: service_started

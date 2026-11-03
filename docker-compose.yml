@@ -1,0 +1,140 @@
+# ==============================================================================
+# Smart AI Voice Agent — Docker Compose
+#
+# Services:
+#   ollama       — Local LLM daemon (Llama 3.2:3b by default)
+#   backend      — FastAPI + Pipecat voice pipeline (port 8000)
+#   consumer_ui  — Guest concierge portal, nginx SPA (port 3000)
+#   admin_ui     — Operations console, nginx SPA (port 5173)
+#
+# Usage:
+#   docker compose up --build          # First run — builds all images
+#   docker compose up                  # Subsequent runs
+#   docker compose down -v             # Stop and remove volumes
+#
+# Cloud provider hot-swap:
+#   Set LLM_PROVIDER, STT_PROVIDER, TTS_PROVIDER and the matching API keys
+#   in your .env file — no rebuild needed (env vars are read at runtime).
+# ==============================================================================
+
+services:
+
+  # ── Ollama — Local LLM Daemon ──────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: smart-voice-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    # Pull the default model on first start.
+    # The entrypoint runs `ollama serve` then pulls the model once.
+    entrypoint: >
+      sh -c "ollama serve &
+             sleep 5 &&
+             ollama pull ${OLLAMA_MODEL:-llama3.2:3b} &&
+             wait"
+    environment:
+      OLLAMA_KEEP_ALIVE: "24h"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:11434/api/tags"]
+      interval: 20s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    # GPU passthrough — uncomment one block if you have a GPU:
+    # NVIDIA:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ── Backend — FastAPI + Pipecat ────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: smart-voice-backend:latest
+    container_name: smart-voice-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override the Ollama URL to use the compose service name
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      # Persist data to named volumes
+      DATABASE_URL: sqlite:////app/data/voice_agent.db
+      CHROMA_PERSIST_DIR: /app/data/chroma_db
+    volumes:
+      - backend_data:/app/data
+      # Hot-reload tenant YAML without rebuilding
+      - ./backend/config/tenants:/app/backend/config/tenants:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  # ── Consumer Portal — Guest WebRTC Concierge ───────────────────────────────
+  consumer_ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
+      args:
+        # The browser reaches the backend directly over the host network.
+        # Change to your server's public URL in production.
+        VITE_API_URL: http://localhost:8000
+    image: smart-voice-consumer:latest
+    container_name: smart-voice-consumer
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  # ── Admin Console — Operations Dashboard ──────────────────────────────────
+  admin_ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin
+      args:
+        VITE_API_URL: http://localhost:8000
+    image: smart-voice-admin:latest
+    container_name: smart-voice-admin
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5173/"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+
+# ── Named Volumes ─────────────────────────────────────────────────────────────
+volumes:
+  ollama_models:
+    driver: local
+  backend_data:
+    driver: local
