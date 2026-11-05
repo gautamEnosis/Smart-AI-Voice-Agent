@@ -5,28 +5,51 @@ from __future__ import annotations
 import re
 from typing import Any
 
-CONFIRM_PATTERN = re.compile(
-    r"\b(yes|yeah|yep|yup|sure|correct|confirmed|confirm|okay|ok|go ahead|"
-    r"do it|book it|that'?s right|sounds good|absolutely)\b",
-    re.IGNORECASE,
+CONFIRMATION_PHRASES = frozenset(
+    {
+        "yes",
+        "yes please",
+        "yes confirm the booking",
+        "yeah",
+        "yeah please",
+        "yep",
+        "yep please",
+        "yup",
+        "sure",
+        "sure please",
+        "correct",
+        "confirmed",
+        "confirm",
+        "okay",
+        "ok",
+        "go ahead",
+        "do it",
+        "book it",
+        "that's right",
+        "that s right",
+        "sounds good",
+        "absolutely",
+    }
 )
-
-MAX_CONFIRMATION_WORDS = 8
 
 
 def user_confirms(last_user_message: str | None) -> bool:
-    """Return True only for a short, explicit spoken confirmation.
+    """Return True only for a short, explicit, unambiguous spoken confirmation.
 
-    Long utterances are treated as new requests, never as a yes.
+    Only a complete, explicitly affirmative phrase is accepted. Additional
+    qualifiers or conversational content make the utterance ambiguous.
     """
     if not last_user_message:
         return False
     text = last_user_message.strip()
     if not text:
         return False
-    if len(text.split()) > MAX_CONFIRMATION_WORDS:
+
+    normalized = re.sub(r"[^\w']+", " ", text.lower()).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if "?" in text:
         return False
-    return bool(CONFIRM_PATTERN.search(text))
+    return normalized in CONFIRMATION_PHRASES
 
 
 def confirmation_granted(

@@ -23,16 +23,16 @@ personas:
       - "hotel_cancel_booking"
       - "hotel_get_amenities"
     voice:
-      provider: "kokoro"
-      voice_id: "af_sarah"
+      provider: "cartesia"
+      voice_id: "86e30c1d-714b-4074-a1f2-1cb6b552fb49"
       fallback_voice_id: "af_bella"
       speed: 1.00
       pitch: 0.0
       gender: "female"
       accent: "en-US"
     llm:
-      provider: "ollama"
-      model: "llama3.2:3b"
+      provider: "groq"
+      model: "openai/gpt-oss-120b"
       temperature: 0.2
       max_tokens: 180
 

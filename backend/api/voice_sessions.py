@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -75,6 +76,9 @@ class ConsumerVoiceSessionManager:
         self._handler = SmallWebRTCRequestHandler()
         self._sessions: dict[str, ConsumerVoiceSession] = {}
         self._sessions_lock = asyncio.Lock()
+        self._pending_offer_reservations: set[object] = set()
+        self._rate_limits: dict[str, list[float]] = {}
+        self._rate_limits_lock = asyncio.Lock()
 
     def configuration(self, tenant_id: str) -> ConsumerConfigurationResponse:
         """Return safe consumer bootstrap configuration for the requested tenant."""
@@ -87,8 +91,27 @@ class ConsumerVoiceSessionManager:
             persona=persona.key,
         )
 
-    async def create_offer(self, request: VoiceOfferRequest) -> VoiceOfferResponse:
+    async def create_offer(
+        self,
+        request: VoiceOfferRequest,
+        client_ip: str = "127.0.0.1",
+    ) -> VoiceOfferResponse:
         """Turn a browser SDP offer into a SmallWebRTC answer."""
+        # SEC-02: In-memory sliding-window rate limiting per IP
+        now = time.monotonic()
+        window = float(self._settings.voice_offer_rate_window_seconds)
+        max_rate = self._settings.voice_offer_rate_limit
+        async with self._rate_limits_lock:
+            timestamps = [t for t in self._rate_limits.get(client_ip, []) if now - t < window]
+            if len(timestamps) >= max_rate:
+                self._rate_limits[client_ip] = timestamps
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many connection attempts. Please wait a moment before reconnecting.",
+                )
+            timestamps.append(now)
+            self._rate_limits[client_ip] = timestamps
+
         tenant = self._tenant_for(request.request_data.tenant_id)
         persona = request.request_data.persona or tenant.get_active_persona().key
         if persona not in tenant.personas:
@@ -106,16 +129,42 @@ class ConsumerVoiceSessionManager:
             request_data=request_context.model_dump(),
         )
 
-        async def on_connection(connection: SmallWebRTCConnection) -> None:
-            await self._register_connection(connection, request_context, tenant)
+        # Reserve a slot atomically so concurrent offers cannot exceed the cap.
+        reservation: object | None = None
+        async with self._sessions_lock:
+            reconnecting = request.pc_id is not None and request.pc_id in self._sessions
+            if not reconnecting:
+                if (
+                    len(self._sessions) + len(self._pending_offer_reservations)
+                    >= self._settings.max_active_voice_sessions
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="The concierge is currently handling the maximum number of concurrent voice sessions. Please try again shortly.",
+                    )
+                reservation = object()
+                self._pending_offer_reservations.add(reservation)
 
-        answer = await self._handler.handle_web_request(pipecat_request, on_connection)
-        if answer is None:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="The local voice transport did not produce an SDP answer.",
+        async def on_connection(connection: SmallWebRTCConnection) -> None:
+            await self._register_connection(
+                connection,
+                request_context,
+                tenant,
+                reservation=reservation,
             )
-        return VoiceOfferResponse.model_validate(answer)
+
+        try:
+            answer = await self._handler.handle_web_request(pipecat_request, on_connection)
+            if answer is None:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="The local voice transport did not produce an SDP answer.",
+                )
+            return VoiceOfferResponse.model_validate(answer)
+        finally:
+            if reservation is not None:
+                async with self._sessions_lock:
+                    self._pending_offer_reservations.discard(reservation)
 
     async def add_ice_candidates(self, request: VoiceIcePatchRequest) -> None:
         """Forward a small, validated candidate batch to SmallWebRTC."""
@@ -157,10 +206,13 @@ class ConsumerVoiceSessionManager:
         connection: SmallWebRTCConnection,
         context: ConsumerSessionRequest,
         tenant: TenantConfig,
+        reservation: object | None = None,
     ) -> None:
         """Attach lifecycle handlers, construct voice pipeline, and queue safe initial state."""
         session = ConsumerVoiceSession(connection=connection, request_context=context)
         async with self._sessions_lock:
+            if reservation is not None:
+                self._pending_offer_reservations.discard(reservation)
             self._sessions[connection.pc_id] = session
 
         # Attach real-time Pipecat pipeline

@@ -6,7 +6,6 @@ using Pydantic v2 BaseSettings with strict validation and sane local-first defau
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -119,6 +118,13 @@ class AppSettings(BaseSettings):
     environment: Literal["development", "production", "testing"] = "development"
     admin_cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     consumer_cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    # Security & Rate Limiting Controls (Phase 8A)
+    admin_api_key: str | None = None
+    voice_offer_rate_limit: int = 5
+    voice_offer_rate_window_seconds: int = 60
+    max_active_voice_sessions: int = 10
+    voice_session_idle_timeout_seconds: int = 300
 
     # Storage Paths
     database_url: str = "sqlite:///./data/voice_agent.db"

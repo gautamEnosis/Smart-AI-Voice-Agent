@@ -42,7 +42,7 @@ def create_app() -> FastAPI:
         allow_origins=origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "PATCH"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "Authorization"],
     )
     application.include_router(admin_router)
     application.include_router(voice_router)
@@ -56,4 +56,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-

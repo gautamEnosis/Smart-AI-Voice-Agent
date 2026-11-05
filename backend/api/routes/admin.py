@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 
 from backend.api.audition import VoiceAuditionUnavailable, synthesize_audition
-from backend.api.knowledge import KnowledgeHubService, MAX_DOCUMENT_BYTES
+from backend.api.auth import verify_admin_key
+from backend.api.knowledge import MAX_DOCUMENT_BYTES, KnowledgeHubService
 from backend.api.runtime import get_admin_telemetry, get_provider_runtime_store
 from backend.api.schemas import (
     DashboardResponse,
@@ -25,7 +26,11 @@ from backend.config.settings import get_settings
 from backend.engine.audio.voice_catalog import list_available_voices
 from backend.engine.providers.base import ProviderConfigurationError
 
-router = APIRouter(prefix="/api/v1/admin", tags=["Enterprise Admin"])
+router = APIRouter(
+    prefix="/api/v1/admin",
+    tags=["Enterprise Admin"],
+    dependencies=[Depends(verify_admin_key)],
+)
 
 
 @lru_cache(maxsize=1)
@@ -160,4 +165,3 @@ def search_knowledge(payload: KnowledgeSearchRequest) -> KnowledgeSearchResponse
         return get_knowledge_hub().search(payload.tenant_id, payload.query)
     except ValueError as exc:
         raise _bad_request(str(exc)) from exc
-

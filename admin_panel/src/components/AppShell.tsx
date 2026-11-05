@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Activity, BookOpenText, Gauge, Headphones, Settings2, Sparkles } from 'lucide-react';
+import { Activity, BookOpenText, Gauge, Headphones, LogOut, Settings2, Sparkles } from 'lucide-react';
 
 import { cn } from '../lib/utils';
 
@@ -8,6 +8,7 @@ export type AdminView = 'dashboard' | 'voice-studio' | 'knowledge-hub' | 'provid
 interface AppShellProps {
   activeView: AdminView;
   onViewChange: (view: AdminView) => void;
+  onLogout: () => void;
   children: ReactNode;
 }
 
@@ -19,7 +20,7 @@ const navigation: Array<{ view: AdminView; label: string; icon: typeof Gauge }> 
 ];
 
 /** Application frame with responsive navigation and a fixed operational context. */
-export function AppShell({ activeView, onViewChange, children }: AppShellProps) {
+export function AppShell({ activeView, onViewChange, onLogout, children }: AppShellProps) {
   return (
     <div className="min-h-screen bg-mesh">
       <div className="mx-auto flex min-h-screen max-w-[1700px]">
@@ -48,24 +49,33 @@ export function AppShell({ activeView, onViewChange, children }: AppShellProps) 
             <div className="flex items-center gap-2 text-sm font-semibold text-indigo-100"><Sparkles className="h-4 w-4" /> Local-first control</div>
             <p className="mt-2 text-xs leading-5 text-indigo-200/70">Cloud providers remain optional. Credentials never enter this console.</p>
           </div>
+          <button type="button" onClick={onLogout} className="mt-4 flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-slate-400 hover:bg-slate-900 hover:text-white">
+            <LogOut className="h-4 w-4" aria-hidden="true" />
+            Sign out
+          </button>
         </aside>
 
         <main className="min-w-0 flex-1 px-4 pb-8 pt-4 sm:px-7 sm:pt-7 lg:px-10">
           <header className="mb-7 flex items-center justify-between gap-4 lg:hidden">
             <Brand compact />
-            <div className="flex rounded-xl border border-slate-800 bg-slate-950/70 p-1" aria-label="Mobile navigation">
-              {navigation.map(({ view, label, icon: Icon }) => (
-                <button
-                  key={view}
-                  type="button"
-                  onClick={() => onViewChange(view)}
-                  className={cn('rounded-lg p-2', activeView === view ? 'bg-indigo-500/20 text-white' : 'text-slate-400')}
-                  aria-label={label}
-                  aria-current={activeView === view ? 'page' : undefined}
-                >
-                  <Icon className="h-4 w-4" />
-                </button>
-              ))}
+            <div className="flex items-center gap-2">
+              <div className="flex rounded-xl border border-slate-800 bg-slate-950/70 p-1" aria-label="Mobile navigation">
+                {navigation.map(({ view, label, icon: Icon }) => (
+                  <button
+                    key={view}
+                    type="button"
+                    onClick={() => onViewChange(view)}
+                    className={cn('rounded-lg p-2', activeView === view ? 'bg-indigo-500/20 text-white' : 'text-slate-400')}
+                    aria-label={label}
+                    aria-current={activeView === view ? 'page' : undefined}
+                  >
+                    <Icon className="h-4 w-4" />
+                  </button>
+                ))}
+              </div>
+              <button type="button" onClick={onLogout} className="rounded-lg p-2 text-slate-400 hover:bg-slate-900 hover:text-white" aria-label="Sign out">
+                <LogOut className="h-4 w-4" aria-hidden="true" />
+              </button>
             </div>
           </header>
           {children}
