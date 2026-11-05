@@ -25,10 +25,25 @@ The platform ships three applications plus a local LLM daemon:
 
 ## Quick Start
 
+### Before first run: configure the admin key
+
+The admin API is disabled until `ADMIN_API_KEY` is set. Create a private
+`.env` file from the template, generate a unique key, and set it before starting
+the backend or Docker Compose:
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Copy the generated value into `.env` as `ADMIN_API_KEY=<generated-value>`.
+If `.env` already exists, keep it and add the key without replacing other
+settings. Keep `.env` private and do not commit or share the key. If you change
+it while the backend is running, restart the backend to load the new value.
+
 ### Option A — Docker Compose (everything in containers)
 
 ```bash
-cp .env.example .env          # required: compose reads .env
 docker compose up --build     # first run (builds images, pulls the LLM model)
 docker compose up             # subsequent runs
 ```
@@ -37,11 +52,13 @@ This starts all four services with health checks and correct wiring
 (`OLLAMA_BASE_URL=http://ollama:11434/v1` inside the stack):
 
 - Consumer portal → <http://localhost:3000>
-- Admin console → <http://localhost:5173>
+- Admin console → <http://localhost:5173> (sign in with `ADMIN_API_KEY`)
 - API gateway + Swagger docs → <http://localhost:8000/docs>
-- Ollama → <http://localhost:11434>
+- Ollama API → <http://localhost:11434> (bound to localhost only)
 
-Stop everything with `docker compose down` (add `-v` to also drop volumes).
+Stop services with `docker compose down`. This keeps stored data; avoid `-v`
+unless you intentionally want to delete the persistent model and application
+volumes.
 
 ### Option B — Manual (local development)
 
@@ -52,10 +69,11 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows — use `source .venv/bin/activate` on macOS/Linux
 pip install -r requirements.txt
 
-cp .env.example .env            # local-first defaults; edit only if you need cloud providers
-
 uvicorn backend.api.app:app --host 0.0.0.0 --port 8000
 ```
+
+Create `.env` from `.env.example` in PowerShell if you have not already done
+so, then set `ADMIN_API_KEY` as described above.
 
 Verify: <http://localhost:8000/health> → `{"status":"ok","service":"omnivox-gateway"}`
 API reference: <http://localhost:8000/docs>
@@ -92,16 +110,13 @@ npm install
 npm run dev                     # http://localhost:5173
 ```
 
-API base defaults to `http://localhost:8000`; override with `VITE_API_BASE_URL`.
-The console asks for `ADMIN_API_KEY` from the backend `.env` and keeps it only
-for the current browser tab. Generate a unique key before starting the backend:
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-Set the generated value as `ADMIN_API_KEY` in `.env`; admin endpoints fail
-closed when the key is unset.
+API base defaults to `http://localhost:8000`. For Docker builds, set the
+`VITE_API_BASE_URL` build argument in `docker-compose.yml` to the API URL
+reachable by the browser.
+Open <http://localhost:5173> and enter the same `ADMIN_API_KEY` configured for
+the backend. The console stores it only in the current browser tab; signing out
+or closing the tab removes it. A rejected key clears the stored value and asks
+you to sign in again.
 For HTTPS deployments, update the Nginx `connect-src` policy in
 `docker/nginx/admin.conf` and `docker/nginx/consumer.conf` to the deployed API
 and signaling origins.
@@ -110,6 +125,35 @@ and signaling origins.
 
 Go to <http://localhost:3000>, click **Connect**, allow microphone access, and
 start talking (or type). Localhost WebRTC needs no STUN/TURN server.
+
+---
+
+## Security behavior and troubleshooting
+
+- Every `/api/v1/admin/*` endpoint requires a bearer token in the `Authorization`
+  header.
+  The backend has no default key and returns `503` for admin requests if the
+  key is missing; a missing or incorrect browser key returns `401`.
+- Voice offer signaling is limited to 5 requests per client IP per minute,
+  active sessions are capped at 10 by default, and idle sessions close after
+  300 seconds. These limits can be changed with `VOICE_OFFER_RATE_LIMIT`,
+  `VOICE_OFFER_RATE_WINDOW_SECONDS`, `MAX_ACTIVE_VOICE_SESSIONS`, and
+  `VOICE_SESSION_IDLE_TIMEOUT_SECONDS`.
+- Keep the API behind HTTPS when accessed over an untrusted network. The
+  included Nginx CSP allows the local API at `http://localhost:8000`; update
+  `connect-src` in both Nginx configs when hosting the API at another origin.
+- Ollama is published only on the host loopback interface in Compose. Do not
+  expose its port publicly.
+
+| Symptom | Resolution |
+|---|---|
+| Admin console reports the API key is invalid | Confirm the console key exactly matches `ADMIN_API_KEY` in the backend `.env`; restart the backend after changing `.env`. |
+| Admin API returns `503` | Set a non-empty `ADMIN_API_KEY` in `.env`, then restart the backend/container. |
+| Admin API returns `401` repeatedly | Sign out or reload the console and enter the correct key. |
+| Admin API request fails with a CORS error | Confirm the console origin is in `ADMIN_CORS_ORIGINS` and that the API allows the `Authorization` header. |
+| Voice offer returns `429` | Wait for the per-IP rate window to expire before trying again. |
+| Voice offer returns `503` | The active-session cap has been reached; wait for an existing call to end or increase the configured cap. |
+| Admin console cannot reach a remote API | Set `VITE_API_BASE_URL` for the console build and update Nginx `connect-src` to include the API origin. |
 
 ---
 
