@@ -39,25 +39,12 @@ def create_tts_service(
         )
         try:
             from pipecat.services.kokoro.tts import KokoroTTSService
-            return KokoroTTSService(voice_id=voice_id, speed=speed)
-        except ImportError:
-            from pipecat.processors.frame_processor import FrameProcessor
+        except ImportError as exc:
+            raise MissingDependencyError(
+                "pipecat-ai[kokoro] is required for Kokoro TTS."
+            ) from exc
 
-            class KokoroLocalTTSStub(FrameProcessor):
-                def __init__(self, voice_id: str, speed: float) -> None:
-                    super().__init__()
-                    self.voice_id = voice_id
-                    self.speed = speed
-                    self.provider = "kokoro"
-
-                async def process_frame(self, frame: Any, direction: Any) -> None:
-                    await super().process_frame(frame, direction)
-                    await self.push_frame(frame, direction)
-
-                def __repr__(self) -> str:
-                    return f"<KokoroLocalTTSStub voice={self.voice_id} speed={self.speed}>"
-
-            return KokoroLocalTTSStub(voice_id=voice_id, speed=speed)
+        return KokoroTTSService(voice_id=voice_id, speed=speed)
 
     elif provider == "cartesia":
         api_key = app_cfg.cartesia_api_key

@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from backend.config.settings import AppSettings, LLMSettings, VoiceSettings, load_tenant_config
 from backend.engine.providers.base import (
+    MissingDependencyError,
     ProviderConfigurationError,
     UnsupportedProviderError,
 )
@@ -52,10 +53,11 @@ class TestConfiguration(unittest.TestCase):
 
         persona = tenant.get_active_persona()
         self.assertEqual(persona.name, "Elena")
-        self.assertEqual(persona.voice.provider, "kokoro")
-        self.assertEqual(persona.voice.voice_id, "af_sarah")
+        self.assertEqual(persona.voice.provider, "cartesia")
+        self.assertEqual(persona.voice.voice_id, "86e30c1d-714b-4074-a1f2-1cb6b552fb49")
         self.assertEqual(persona.voice.speed, 1.00)
-        self.assertEqual(persona.llm.provider, "ollama")
+        self.assertEqual(persona.llm.provider, "groq")
+        self.assertEqual(persona.llm.model, "openai/gpt-oss-120b")
         self.assertIn("hotel_check_availability", persona.tools)
 
 
@@ -136,11 +138,32 @@ class TestSTTFactory(unittest.TestCase):
         self.assertIn("GROQ_API_KEY is required", str(ctx.exception))
 
     def test_faster_whisper_default_creation(self):
-        """Default STT returns local faster-whisper service/stub."""
+        """Default STT creates the configured Faster-Whisper service."""
         settings = AppSettings(_env_file=None, stt_provider="faster_whisper")
-        service = create_stt_service(settings)
-        self.assertIsNotNone(service)
-        self.assertTrue(hasattr(service, "model") or hasattr(service, "provider"))
+        mock_service = MagicMock()
+        module = MagicMock(WhisperSTTService=mock_service)
+
+        with patch.dict(sys.modules, {"pipecat.services.whisper.stt": module}):
+            service = create_stt_service(settings)
+
+        self.assertEqual(service, mock_service.return_value)
+        mock_service.assert_called_once_with(model="base.en")
+
+    def test_missing_faster_whisper_dependency_raises_error(self):
+        """Missing speech dependencies must not silently produce a pass-through stub."""
+        settings = AppSettings(_env_file=None, stt_provider="faster_whisper")
+
+        with patch.dict(
+            sys.modules,
+            {
+                "pipecat.services.whisper.stt": None,
+                "pipecat.services.whisper": None,
+            },
+        ):
+            with self.assertRaises(MissingDependencyError) as ctx:
+                create_stt_service(settings)
+
+        self.assertIn("pipecat-ai[whisper]", str(ctx.exception))
 
 
 class TestTTSFactory(unittest.TestCase):
@@ -157,10 +180,24 @@ class TestTTSFactory(unittest.TestCase):
     def test_kokoro_default_creation(self):
         """Kokoro TTS instantiates with voice_id and speed."""
         settings = AppSettings(_env_file=None, tts_provider="kokoro")
-        service = create_tts_service(settings)
-        self.assertIsNotNone(service)
-        self.assertEqual(service.voice_id, "af_sarah")
-        self.assertEqual(service.speed, 1.00)
+        mock_service = MagicMock()
+        module = MagicMock(KokoroTTSService=mock_service)
+
+        with patch.dict(sys.modules, {"pipecat.services.kokoro.tts": module}):
+            service = create_tts_service(settings)
+
+        self.assertEqual(service, mock_service.return_value)
+        mock_service.assert_called_once_with(voice_id="af_sarah", speed=1.00)
+
+    def test_missing_kokoro_dependency_raises_error(self):
+        """Missing Kokoro dependencies must not silently produce a pass-through stub."""
+        settings = AppSettings(_env_file=None, tts_provider="kokoro")
+
+        with patch.dict(sys.modules, {"pipecat.services.kokoro.tts": None}):
+            with self.assertRaises(MissingDependencyError) as ctx:
+                create_tts_service(settings)
+
+        self.assertIn("pipecat-ai[kokoro]", str(ctx.exception))
 
     def test_unsupported_tts_provider_raises_error(self):
         """Requesting invalid TTS provider raises UnsupportedProviderError."""

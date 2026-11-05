@@ -17,14 +17,13 @@ from __future__ import annotations
 import asyncio
 import unittest
 import urllib.request
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import patch
 
-from backend.api.schemas import ConsumerSessionRequest
-from backend.api.voice_sessions import ConsumerVoiceSessionManager
-from backend.config.settings import AppSettings, load_tenant_config
-from backend.engine.pipeline import create_consumer_voice_pipeline
 from pipecat.frames.frames import (
+    Frame,
     LLMContextFrame,
     LLMRunFrame,
     TextFrame,
@@ -32,6 +31,11 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+
+from backend.api.schemas import ConsumerSessionRequest
+from backend.api.voice_sessions import ConsumerVoiceSessionManager
+from backend.config.settings import AppSettings, load_tenant_config
+from backend.engine.pipeline import create_consumer_voice_pipeline
 
 
 class RecordingConnection(SmallWebRTCConnection):
@@ -72,6 +76,14 @@ class ScriptedLLMService(FrameProcessor):
             self.run_requests += 1
             await self.push_frame(TextFrame(self._reply), direction)
             return
+        await self.push_frame(frame, direction)
+
+
+class PassThroughSpeechProcessor(FrameProcessor):
+    """Keep pipeline tests independent from local speech model downloads."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
 
 
@@ -139,8 +151,16 @@ class TestLivePipelineStartup(unittest.TestCase):
         async def scenario() -> None:
             connection = RecordingConnection()
             tenant = load_tenant_config()
-            with patch(
-                "backend.engine.pipeline.create_llm_service", return_value=scripted
+            with (
+                patch("backend.engine.pipeline.create_llm_service", return_value=scripted),
+                patch(
+                    "backend.engine.pipeline.create_stt_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+                patch(
+                    "backend.engine.pipeline.create_tts_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
             ):
                 session = await create_consumer_voice_pipeline(
                     connection=connection,
@@ -195,8 +215,16 @@ class TestLivePipelineStartup(unittest.TestCase):
         async def scenario() -> None:
             connection = RecordingConnection()
             tenant = load_tenant_config()
-            with patch(
-                "backend.engine.pipeline.create_llm_service", return_value=scripted
+            with (
+                patch("backend.engine.pipeline.create_llm_service", return_value=scripted),
+                patch(
+                    "backend.engine.pipeline.create_stt_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+                patch(
+                    "backend.engine.pipeline.create_tts_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
             ):
                 session = await create_consumer_voice_pipeline(
                     connection=connection,
@@ -242,8 +270,16 @@ class TestLivePipelineStartup(unittest.TestCase):
         async def scenario() -> None:
             connection = RecordingConnection()
             tenant = load_tenant_config()
-            with patch(
-                "backend.engine.pipeline.create_llm_service", return_value=scripted
+            with (
+                patch("backend.engine.pipeline.create_llm_service", return_value=scripted),
+                patch(
+                    "backend.engine.pipeline.create_stt_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+                patch(
+                    "backend.engine.pipeline.create_tts_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
             ):
                 session = await create_consumer_voice_pipeline(
                     connection=connection,
@@ -261,7 +297,7 @@ class TestLivePipelineStartup(unittest.TestCase):
                         TranscriptionFrame(
                             text="Yes, please confirm the booking",
                             user_id="guest-1",
-                            timestamp=1.0,
+                            timestamp=datetime.now(UTC).isoformat(),
                         )
                     ]
                 )
@@ -301,12 +337,22 @@ class TestLivePipelineStartup(unittest.TestCase):
             connection = RecordingConnection()
             tenant = load_tenant_config()
             # No factory patch: this uses the real configured local provider.
-            session = await create_consumer_voice_pipeline(
-                connection=connection,
-                tenant=tenant,
-                persona_key="hotel_booking_specialist",
-                settings=AppSettings(),
-            )
+            with (
+                patch(
+                    "backend.engine.pipeline.create_stt_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+                patch(
+                    "backend.engine.pipeline.create_tts_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+            ):
+                session = await create_consumer_voice_pipeline(
+                    connection=connection,
+                    tenant=tenant,
+                    persona_key="hotel_booking_specialist",
+                    settings=AppSettings(),
+                )
             try:
                 await session.start()
                 await session.inject_user_text(
