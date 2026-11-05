@@ -93,6 +93,18 @@ npm run dev                     # http://localhost:5173
 ```
 
 API base defaults to `http://localhost:8000`; override with `VITE_API_BASE_URL`.
+The console asks for `ADMIN_API_KEY` from the backend `.env` and keeps it only
+for the current browser tab. Generate a unique key before starting the backend:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Set the generated value as `ADMIN_API_KEY` in `.env`; admin endpoints fail
+closed when the key is unset.
+For HTTPS deployments, update the Nginx `connect-src` policy in
+`docker/nginx/admin.conf` and `docker/nginx/consumer.conf` to the deployed API
+and signaling origins.
 
 **5. Open the portal**
 
@@ -111,6 +123,7 @@ Copy `.env.example` → `.env`. All defaults are local-first ($0 compute):
 | `OLLAMA_MODEL` / `OLLAMA_BASE_URL` | `llama3.2:3b` / `http://localhost:11434/v1` | Local LLM endpoint |
 | `STT_PROVIDER` | `faster_whisper` | Speech-to-text backend |
 | `TTS_PROVIDER` | `kokoro` | Text-to-speech backend |
+| `ADMIN_API_KEY` | *(unset; required for admin access)* | Secret bearer key used by the Admin Console |
 | `FASTER_WHISPER_MODEL` | `base.en` | Whisper model size |
 | `KOKORO_VOICE_ID` / `KOKORO_SPEED` | `af_sarah` / `1.00` | Voice profile |
 | `DATABASE_URL` | `sqlite:///./data/voice_agent.db` | SQLite persistence |

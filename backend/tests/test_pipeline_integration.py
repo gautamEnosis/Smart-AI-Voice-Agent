@@ -328,6 +328,100 @@ class TestLivePipelineStartup(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_spoken_pii_is_masked_before_context_and_captions(self) -> None:
+        """Spoken payment data is redacted before reaching context or the browser."""
+        scripted = ScriptedLLMService("I can help with that payment.")
+
+        async def scenario() -> None:
+            connection = RecordingConnection()
+            tenant = load_tenant_config()
+            with (
+                patch("backend.engine.pipeline.create_llm_service", return_value=scripted),
+                patch(
+                    "backend.engine.pipeline.create_stt_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+                patch(
+                    "backend.engine.pipeline.create_tts_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+            ):
+                session = await create_consumer_voice_pipeline(
+                    connection=connection,
+                    tenant=tenant,
+                    persona_key="hotel_booking_specialist",
+                    settings=AppSettings(),
+                )
+
+            raw_text = "My card number is 4532 0150 1234 5671 and the CVV is 842."
+            try:
+                await session.start()
+                await session.worker.queue_frames(
+                    [
+                        TranscriptionFrame(
+                            text=raw_text,
+                            user_id="guest-1",
+                            timestamp=datetime.now(UTC).isoformat(),
+                        )
+                    ]
+                )
+
+                redacted = await wait_until(
+                    lambda: any(
+                        message.get("role") == "user"
+                        and "[CARD REDACTED]" in message.get("content", "")
+                        for message in session.context.messages
+                    ),
+                    timeout=5.0,
+                )
+                self.assertTrue(redacted, "Spoken card data was not redacted in LLM context")
+                user_context = next(
+                    message["content"]
+                    for message in session.context.messages
+                    if message.get("role") == "user"
+                    and "[CARD REDACTED]" in message.get("content", "")
+                )
+                self.assertIn("[CVV REDACTED]", user_context)
+                self.assertNotIn("4532", user_context)
+                self.assertNotIn("842", user_context)
+
+                guest_caption_ready = await wait_until(
+                    lambda: bool(captions_for(connection.sent_messages, "guest")),
+                    timeout=5.0,
+                )
+                self.assertTrue(guest_caption_ready, "No guest caption was emitted")
+                guest_caption = captions_for(connection.sent_messages, "guest")[0]["text"]
+                self.assertIn("[CARD REDACTED]", guest_caption)
+                self.assertIn("[CVV REDACTED]", guest_caption)
+                self.assertNotIn("4532", guest_caption)
+                self.assertNotIn("842", guest_caption)
+                self.assertNotIn("4532", session.mcp_hub.session.last_user_message)
+                self.assertNotIn("842", session.mcp_hub.session.last_user_message)
+
+                typed_text = "My tax ID is 12-3456789 and my card is 4532015012345671."
+                await session.inject_user_text(typed_text)
+                self.assertEqual(
+                    session.mcp_hub.session.last_user_message,
+                    "My tax ID is [TAX ID REDACTED] and my card is [CARD REDACTED].",
+                )
+
+                await session.inject_touch_override(
+                    "R-101",
+                    "My card number is 4532015012345671",
+                )
+                touch_context = next(
+                    message["content"]
+                    for message in reversed(session.context.messages)
+                    if message.get("role") == "developer"
+                    and "Guest tapped" in message.get("content", "")
+                )
+                self.assertIn("[CARD REDACTED]", touch_context)
+                self.assertNotIn("4532015012345671", touch_context)
+            finally:
+                await session.stop()
+
+        asyncio.run(scenario())
+
     @unittest.skipUnless(ollama_reachable(), "Local Ollama daemon not reachable")
     def test_local_llm_produces_an_agent_caption(self) -> None:
         """6B item 4: a real local LLM roundtrip over the running pipeline."""

@@ -1,6 +1,6 @@
 """Live multimodal Pipecat voice pipeline and generative DataChannel emitters.
 
-Connects SmallWebRTCTransport, Silero VAD, STT, LLM context + MCP tools,
+Connects SmallWebRTCTransport, Silero VAD, STT, PII Sanitizer, LLM context + MCP tools,
 Sentence Aggregator, DataChannel Bridge, Speech Normalizer, and TTS into an
 active, real-time voice pipeline.
 """
@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -39,6 +41,7 @@ from pipecat.workers.runner import WorkerRunner
 
 from backend.config.settings import AppSettings, TenantConfig, get_settings
 from backend.engine.audio.normalizer import normalize_speech_text
+from backend.engine.audio.pii_sanitizer import PIISanitizerProcessor, sanitize_pii_text
 from backend.engine.providers.llm_factory import create_llm_service
 from backend.engine.providers.stt_factory import create_stt_service
 from backend.engine.providers.tts_factory import create_tts_service
@@ -109,13 +112,23 @@ class DataChannelBridgeProcessor(FrameProcessor):
         self,
         connection: SmallWebRTCConnection | Any,
         role: str = "both",
+        on_activity: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._connection = connection
         self._role = role  # "guest", "agent", or "both"
+        self.on_activity = on_activity
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+
+        if self.on_activity is not None and isinstance(
+            frame, (TranscriptionFrame, InterimTranscriptionFrame, TextFrame)
+        ):
+            try:
+                self.on_activity()
+            except Exception:
+                pass
 
         # 1. Guest speech captions from STT
         if self._role in ("guest", "both"):
@@ -358,47 +371,128 @@ class ConsumerVoicePipeline:
     context: LLMContext
     mcp_hub: MCPHub
     runner_task: asyncio.Task[None] | None = None
+    idle_timeout_seconds: float = 300.0
+    last_activity_time: float = field(default_factory=time.monotonic)
+    watchdog_task: asyncio.Task[None] | None = None
     _closed: bool = False
 
+    def touch_activity(self) -> None:
+        """Reset the inactivity watchdog timer when audio or interaction occurs."""
+        self.last_activity_time = time.monotonic()
+
     async def start(self) -> None:
-        """Launch the worker runner background task."""
+        """Launch the worker runner and watchdog background tasks."""
         if self.runner_task is not None and not self.runner_task.done():
             return
         self._closed = False
+        self.touch_activity()
         self.runner_task = asyncio.create_task(self.runner.run())
+        if self.watchdog_task is None or self.watchdog_task.done():
+            self.watchdog_task = asyncio.create_task(self._inactivity_watchdog())
 
     async def stop(self) -> None:
-        """Cancel and clean up the pipeline worker runner."""
+        """Cancel and clean up the pipeline worker runner and watchdog."""
         if self._closed:
             return
         self._closed = True
+
+        watchdog_task = self.watchdog_task
+        self.watchdog_task = None
+        if watchdog_task is not None and watchdog_task is not asyncio.current_task():
+            if not watchdog_task.done():
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Inactivity watchdog failed during pipeline shutdown")
+
         try:
             await self.runner.cancel()
-        except Exception as exc:
-            logger.debug("WorkerRunner cancel note: %s", exc)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Failed to cancel the voice pipeline worker runner")
 
         if self.runner_task is not None:
             if not self.runner_task.done():
                 self.runner_task.cancel()
                 try:
                     await self.runner_task
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
                     pass
+                except Exception:
+                    logger.exception("Voice pipeline worker runner failed during shutdown")
             self.runner_task = None
+
+    async def _close_connection(self) -> None:
+        """Close the peer connection and log failures instead of hiding them."""
+        close = getattr(self.connection, "close", None)
+        if close is None:
+            return
+        try:
+            close_result = close()
+            if asyncio.iscoroutine(close_result):
+                await close_result
+        except Exception:
+            logger.exception("Failed to close voice connection")
+
+    async def _inactivity_watchdog(self) -> None:
+        """Reap zombie or abandoned pipelines after idle timeout expires."""
+        try:
+            while not self._closed:
+                interval = min(15.0, max(0.05, self.idle_timeout_seconds / 4))
+                await asyncio.sleep(interval)
+                if self._closed:
+                    break
+                idle_duration = time.monotonic() - self.last_activity_time
+                if idle_duration >= self.idle_timeout_seconds:
+                    logger.warning(
+                        "Voice session reached idle timeout (%.1fs >= %.1fs). Reaping pipeline.",
+                        idle_duration,
+                        self.idle_timeout_seconds,
+                    )
+                    if hasattr(self.connection, "send_app_message"):
+                        try:
+                            self.connection.send_app_message(
+                                {
+                                    "type": "ui_error",
+                                    "message": "Session closed due to inactivity.",
+                                }
+                            )
+                        except Exception:
+                            logger.warning("Failed to notify client about voice session timeout")
+                    await self.stop()
+                    await self._close_connection()
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Inactivity watchdog failed")
+            try:
+                await self.stop()
+            except Exception:
+                logger.exception("Failed to stop voice pipeline after watchdog failure")
+            await self._close_connection()
 
     async def inject_user_text(self, text: str) -> None:
         """Inject typed text from DualInputBar directly into LLM turn context."""
-        cleaned = text.strip()
+        cleaned = sanitize_pii_text(text.strip())
         if not cleaned:
             return
+        self.touch_activity()
         self.context.add_message({"role": "user", "content": cleaned})
         self.mcp_hub.session.set_last_user_message(cleaned)
         await self.worker.queue_frames([LLMRunFrame()])
 
     async def inject_touch_override(self, room_id: str, label: str) -> None:
         """Inject client touch selection as non-committing conversational context."""
+        self.touch_activity()
+        cleaned_room_id = sanitize_pii_text(room_id.strip())
+        cleaned_label = sanitize_pii_text(label.strip())
         hint = (
-            f"[Guest tapped '{label}' (Room ID: {room_id}) on screen. "
+            f"[Guest tapped '{cleaned_label}' (Room ID: {cleaned_room_id}) on screen. "
             "Acknowledge that you see their selection, describe its highlights, "
             "and remind them that you need their verbal confirmation aloud to proceed with booking.]"
         )
@@ -445,6 +539,7 @@ async def create_consumer_voice_pipeline(
     tts_service = create_tts_service(settings=app_settings, override=persona.voice)
 
     # 5. Pipeline Frame Processors
+    pii_sanitizer = PIISanitizerProcessor()
     confirmation_context = ConfirmationGateContextProcessor(session=agent_session)
     guest_caption_bridge = DataChannelBridgeProcessor(connection=connection, role="guest")
     sentence_aggregator = SentenceAggregator()
@@ -462,6 +557,7 @@ async def create_consumer_voice_pipeline(
         [
             transport.input(),
             stt_service,
+            pii_sanitizer,
             confirmation_context,
             guest_caption_bridge,
             user_aggregator,
@@ -475,9 +571,7 @@ async def create_consumer_voice_pipeline(
         ]
     )
 
-    # Idle cancellation is disabled deliberately: sessions are reaped when the
-    # peer connection closes, and a guest who stays silent for five minutes
-    # must not have their live session die silently mid-call.
+    # Idle cancellation in worker is false; the pipeline watchdog task manages reclamation
     worker = PipelineWorker(
         pipeline,
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
@@ -514,7 +608,7 @@ async def create_consumer_voice_pipeline(
         )
         await worker.queue_frames([LLMRunFrame()])
 
-    return ConsumerVoicePipeline(
+    pipeline_instance = ConsumerVoicePipeline(
         connection=connection,
         transport=transport,
         pipeline=pipeline,
@@ -522,4 +616,8 @@ async def create_consumer_voice_pipeline(
         runner=runner,
         context=context,
         mcp_hub=mcp_hub,
+        idle_timeout_seconds=float(app_settings.voice_session_idle_timeout_seconds),
     )
+    guest_caption_bridge.on_activity = pipeline_instance.touch_activity
+    agent_caption_bridge.on_activity = pipeline_instance.touch_activity
+    return pipeline_instance

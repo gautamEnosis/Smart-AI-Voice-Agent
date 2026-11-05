@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 
@@ -20,7 +20,7 @@ SAFE_TENANT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class KnowledgeHubService:
@@ -103,6 +103,19 @@ class KnowledgeHubService:
         if len(content) > MAX_DOCUMENT_BYTES:
             raise ValueError("Documents must be 10 MB or smaller.")
 
+        # SEC-06 / 2.4: Magic-byte and payload inspection to prevent polyglot files
+        extension = Path(filename).suffix.lower()
+        if extension == ".pdf":
+            if not content.startswith(b"%PDF-"):
+                raise ValueError("Invalid PDF format: file header must start with %PDF-.")
+        elif extension in {".txt", ".md"}:
+            if b"\x00" in content:
+                raise ValueError("Text files must not contain binary null bytes.")
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("Text and Markdown files must be valid UTF-8 encoded text.") from exc
+
         tenant_dir = self._uploads_dir / tenant_id
         tenant_dir.mkdir(parents=True, exist_ok=True)
         destination = tenant_dir / filename
@@ -155,4 +168,3 @@ class KnowledgeHubService:
             chunks=chunks,
             fallback_spoken=result["fallback_spoken"],
         )
-

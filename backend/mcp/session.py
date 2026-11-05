@@ -2,14 +2,46 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from backend.engine.audio.pii_sanitizer import sanitize_pii_text
+
+SENSITIVE_KEY_PATTERN = re.compile(
+    r"(card|pan|cvv|cvc|cid|password|token|secret|api_key|pin)",
+    re.IGNORECASE,
+)
+
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
+
+
+def redact_sensitive_audit_args(data: dict[str, Any]) -> dict[str, Any]:
+    """Recursively mask sensitive payment or credential values in audit logs."""
+    sanitized: dict[str, Any] = {}
+    for key, value in data.items():
+        if SENSITIVE_KEY_PATTERN.search(str(key)):
+            sanitized[key] = "[REDACTED]"
+        elif isinstance(value, dict):
+            sanitized[key] = redact_sensitive_audit_args(value)
+        elif isinstance(value, list):
+            sanitized[key] = [
+                redact_sensitive_audit_args(item)
+                if isinstance(item, dict)
+                else sanitize_pii_text(item)
+                if isinstance(item, str)
+                else item
+                for item in value
+            ]
+        elif isinstance(value, str):
+            sanitized[key] = sanitize_pii_text(value)
+        else:
+            sanitized[key] = value
+    return sanitized
 
 
 @dataclass
@@ -42,11 +74,12 @@ class AgentSession:
         result: dict[str, Any],
         latency_ms: float,
     ) -> None:
-        """Append a compact tool-call audit record."""
+        """Append a compact tool-call audit record with sensitive arguments masked."""
+        safe_arguments = redact_sensitive_audit_args(arguments)
         self.audit.append(
             {
                 "tool_name": tool_name,
-                "arguments": arguments,
+                "arguments": safe_arguments,
                 "result_status": result.get("status"),
                 "latency_ms": round(latency_ms, 2),
                 "at": _utc_now(),
