@@ -2,7 +2,7 @@
 
 Applies strict constraints tailored for real-time voice agents:
 - Top-K <= 2 chunks to minimize TTFB and token bloat.
-- Strict similarity threshold cutoff (default >= 0.72).
+- Similarity threshold calibrated for the configured local-hash vector scores.
 - Out-of-scope detection delivering graceful spoken fallbacks.
 - Spoken formatting rules (1-2 sentences, no bullets or tables).
 
@@ -13,19 +13,22 @@ fully local.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from typing import Any
 
 from backend.rag.chunker import DocumentChunk
-from backend.rag.vector_store import BaseVectorStore, get_vector_store
+from backend.rag.vector_store import BaseVectorStore, VectorStoreError, get_vector_store
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SIMILARITY_THRESHOLD = 0.72
+DEFAULT_SIMILARITY_THRESHOLD = 0.20
 DEFAULT_TOP_K = 2
 MAX_TOP_K = 2
 MAX_SPOKEN_SENTENCES = 2
+TURN_CONTEXT_MARKER = "[Current-turn uploaded knowledge]"
 
 FALLBACK_SPOKEN_RESPONSE = (
     "I don't have that specific information on file, "
@@ -33,14 +36,11 @@ FALLBACK_SPOKEN_RESPONSE = (
 )
 
 try:
-    from pipecat.frames.frames import Frame, TranscriptionFrame
+    from pipecat.frames.frames import Frame
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-    _PIPECAT_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional runtime dependency
-    _PIPECAT_AVAILABLE = False
     Frame = Any  # type: ignore[misc, assignment]
-    TranscriptionFrame = type("TranscriptionFrame", (), {})  # type: ignore[misc, assignment]
 
     class FrameDirection:  # type: ignore[no-redef]
         DOWNSTREAM = "downstream"
@@ -149,8 +149,7 @@ class RAGContextRetriever:
 
         filtered = [c for c in all_results if c.score >= self.similarity_threshold]
         logger.info(
-            "RAG search query='%s' -> retrieved=%d, above_threshold=%d (threshold=%.2f)",
-            query,
+            "RAG search -> retrieved=%d, above_threshold=%d (threshold=%.2f)",
             len(all_results),
             len(filtered),
             self.similarity_threshold,
@@ -176,7 +175,7 @@ class RAGContextRetriever:
         )
 
         return (
-            "You have access to the following operational knowledge:\n"
+            "You have access to the following tenant-provided knowledge:\n"
             '<hotel_context_reference untrusted="true">\n'
             "<knowledge_base>\n"
             f"{context_body}\n"
@@ -195,23 +194,95 @@ class RAGContextRetriever:
         metadata_filter: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Executes retrieval and returns context prompt or out-of-scope fallback."""
+        started_at = time.perf_counter()
         chunks = self.retrieve(query, metadata_filter=metadata_filter)
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
 
         if not chunks:
             return {
+                "status": "no_match",
                 "has_context": False,
                 "context_prompt": "",
                 "chunks": [],
                 "fallback_spoken": self.fallback_message,
+                "elapsed_ms": elapsed_ms,
             }
 
         prompt = self.format_prompt_context(chunks, query=query)
         return {
+            "status": "matched",
             "has_context": True,
             "context_prompt": prompt,
             "chunks": chunks,
             "fallback_spoken": None,
+            "elapsed_ms": elapsed_ms,
         }
+
+    def replace_turn_context(
+        self,
+        messages: list[dict[str, str]],
+        result: dict[str, Any],
+    ) -> None:
+        """Replace prior retrieved evidence with only the current-turn result."""
+        updated = [
+            message.copy()
+            for message in messages
+            if not (
+                message.get("role") == "developer"
+                and message.get("content", "").startswith(TURN_CONTEXT_MARKER)
+            )
+        ]
+        status = result.get("status")
+        if status == "matched":
+            content = f"{TURN_CONTEXT_MARKER}\n{result['context_prompt']}"
+        elif status == "no_match":
+            content = (
+                f"{TURN_CONTEXT_MARKER}\nNo supporting uploaded-document passage was found for this turn. "
+                "Do not invent facts or claim the documents support an answer. "
+                "You may answer from verified general information or use an appropriate live tool."
+            )
+        else:
+            content = (
+                f"{TURN_CONTEXT_MARKER}\nThe uploaded knowledge search is unavailable for this turn. "
+                "Do not claim the documents were searched or invent facts. "
+                "Use an appropriate live tool when available."
+            )
+        updated.append({"role": "developer", "content": content})
+        messages[:] = updated
+
+    async def update_turn_context(
+        self,
+        messages: list[dict[str, str]],
+        query: str,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Retrieve off-thread and update the conversation with one turn-scoped result."""
+        started_at = time.perf_counter()
+        try:
+            result = await asyncio.to_thread(
+                self.query_with_context,
+                query,
+                metadata_filter,
+            )
+        except VectorStoreError as exc:
+            logger.error("Tenant knowledge retrieval failed: %s", exc)
+            result = {
+                "status": "unavailable",
+                "has_context": False,
+                "context_prompt": "",
+                "chunks": [],
+                "fallback_spoken": None,
+            }
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        result["elapsed_ms"] = elapsed_ms
+        logger.info(
+            "Tenant knowledge turn completed status=%s chunks=%d elapsed_ms=%.2f",
+            result["status"],
+            len(result["chunks"]),
+            elapsed_ms,
+        )
+        self.replace_turn_context(messages, result)
+        return result
 
     def apply_to_messages(
         self,
@@ -219,30 +290,15 @@ class RAGContextRetriever:
         query: str,
         metadata_filter: dict[str, Any] | None = None,
     ) -> list[dict[str, str]]:
-        """Injects knowledge (or the spoken fallback) into an LLM message list."""
+        """Returns an LLM message list with only the current turn's retrieval context."""
         result = self.query_with_context(query, metadata_filter=metadata_filter)
-        injection = (
-            result["context_prompt"]
-            if result["has_context"]
-            else (
-                "No matching hotel policy was found. Reply with exactly this spoken sentence: "
-                f"{self.fallback_message}"
-            )
-        )
-
         updated = [message.copy() for message in messages]
-        for message in updated:
-            if message.get("role") == "system":
-                existing = message.get("content", "")
-                message["content"] = f"{existing}\n\n{injection}".strip()
-                return updated
-
-        updated.insert(0, {"role": "system", "content": injection})
+        self.replace_turn_context(updated, result)
         return updated
 
 
 class RAGContextFrameProcessor(FrameProcessor):
-    """Pipecat pipeline processor that injects RAG context on user transcriptions."""
+    """Inject current-turn retrieval context between the user aggregator and LLM."""
 
     def __init__(
         self,
@@ -256,23 +312,37 @@ class RAGContextFrameProcessor(FrameProcessor):
         self.metadata_filter = metadata_filter
         self.last_query: str = ""
         self.last_result: dict[str, Any] | None = None
-        self.pushed_frames: list[Any] = []
+        self._last_turn_key: tuple[int, str] | None = None
 
-    def _frame_text(self, frame: Any) -> str:
-        text = getattr(frame, "text", None)
-        if isinstance(text, str) and text.strip():
-            return text.strip()
+    async def prepare_turn(self, messages: list[dict[str, str]], query: str) -> dict[str, Any]:
+        """Retrieve and inject knowledge for one finalized spoken or typed turn."""
+        turn_key = (sum(message.get("role") == "user" for message in messages), query)
+        if turn_key == self._last_turn_key and self.last_result is not None:
+            return self.last_result
+
+        self._last_turn_key = turn_key
+        self.last_query = query
+        self.last_result = await self.retriever.update_turn_context(
+            messages,
+            query,
+            metadata_filter=self.metadata_filter,
+        )
+        return self.last_result
+
+    def _frame_messages(self, frame: Any) -> list[dict[str, str]] | None:
         messages = getattr(frame, "messages", None)
         if isinstance(messages, list):
-            for message in reversed(messages):
-                if isinstance(message, dict) and message.get("role") == "user":
-                    content = message.get("content", "")
-                    if isinstance(content, str) and content.strip():
-                        return content.strip()
+            return messages
         context = getattr(frame, "context", None)
         context_messages = getattr(context, "messages", None) if context is not None else None
         if isinstance(context_messages, list):
-            for message in reversed(context_messages):
+            return context_messages
+        return None
+
+    def _frame_text(self, frame: Any) -> str:
+        messages = self._frame_messages(frame)
+        if messages is not None:
+            for message in reversed(messages):
                 if isinstance(message, dict) and message.get("role") == "user":
                     content = message.get("content", "")
                     if isinstance(content, str) and content.strip():
@@ -282,58 +352,22 @@ class RAGContextFrameProcessor(FrameProcessor):
     def _is_user_turn_frame(self, frame: Any) -> bool:
         type_name = type(frame).__name__
         if type_name in {
-            "TranscriptionFrame",
             "LLMMessagesFrame",
             "OpenAILLMContextFrame",
             "LLMContextFrame",
             "LLMMessagesUpdateFrame",
         }:
-            return True
-        if _PIPECAT_AVAILABLE and isinstance(frame, TranscriptionFrame):
-            return True
+            return self._frame_messages(frame) is not None
         return False
 
-    def _inject_into_frame(self, frame: Any, messages: list[dict[str, str]]) -> None:
-        if hasattr(frame, "messages") and isinstance(frame.messages, list):
-            frame.messages = messages
-            return
-        context = getattr(frame, "context", None)
-        if context is not None and hasattr(context, "messages"):
-            context.messages = messages
-
     async def process_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM) -> None:
-        """Retrieves knowledge on user speech frames and forwards the (possibly augmented) frame."""
-        try:
-            await super().process_frame(frame, direction)
-        except Exception:
-            # Stand-alone tests and pre-StartFrame pipeline probes still retrieve.
-            logger.debug("FrameProcessor lifecycle hook skipped for RAG injection.")
-
+        """Retrieves evidence for finalized user-context frames before the LLM."""
+        await super().process_frame(frame, direction)
         if self._is_user_turn_frame(frame):
             query = self._frame_text(frame)
             if query:
-                self.last_query = query
-                self.last_result = self.retriever.query_with_context(
-                    query,
-                    metadata_filter=self.metadata_filter,
-                )
-                existing_messages = getattr(frame, "messages", None)
-                if isinstance(existing_messages, list):
-                    self._inject_into_frame(
-                        frame,
-                        self.retriever.apply_to_messages(existing_messages, query, self.metadata_filter),
-                    )
-                else:
-                    context = getattr(frame, "context", None)
-                    context_messages = getattr(context, "messages", None) if context is not None else None
-                    if isinstance(context_messages, list):
-                        self._inject_into_frame(
-                            frame,
-                            self.retriever.apply_to_messages(context_messages, query, self.metadata_filter),
-                        )
+                messages = self._frame_messages(frame)
+                if messages is not None:
+                    await self.prepare_turn(messages, query)
 
-        self.pushed_frames.append(frame)
-        try:
-            await self.push_frame(frame, direction)
-        except Exception:
-            logger.debug("FrameProcessor push hook skipped for RAG injection.")
+        await self.push_frame(frame, direction)

@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 
 from backend.api.audition import VoiceAuditionUnavailable, synthesize_audition
 from backend.api.auth import verify_admin_key
-from backend.api.knowledge import MAX_DOCUMENT_BYTES, KnowledgeHubService
+from backend.api.knowledge import MAX_DOCUMENT_BYTES, get_knowledge_hub
 from backend.api.runtime import get_admin_telemetry, get_provider_runtime_store
 from backend.api.schemas import (
     DashboardResponse,
@@ -25,18 +23,13 @@ from backend.api.schemas import (
 from backend.config.settings import get_settings
 from backend.engine.audio.voice_catalog import list_available_voices
 from backend.engine.providers.base import ProviderConfigurationError
+from backend.rag.vector_store import VectorStoreError
 
 router = APIRouter(
     prefix="/api/v1/admin",
     tags=["Enterprise Admin"],
     dependencies=[Depends(verify_admin_key)],
 )
-
-
-@lru_cache(maxsize=1)
-def get_knowledge_hub() -> KnowledgeHubService:
-    """Return the shared local Knowledge Hub service."""
-    return KnowledgeHubService(get_settings())
 
 
 def _bad_request(message: str) -> HTTPException:
@@ -53,6 +46,7 @@ def get_dashboard() -> DashboardResponse:
         if option.provider == provider_settings.active.provider
     )
     knowledge_hub = get_knowledge_hub()
+    knowledge_ready, knowledge_detail = knowledge_hub.storage_health()
     return DashboardResponse(
         active_provider=provider_settings.active,
         latest_latency=get_admin_telemetry().latest_turn(),
@@ -68,8 +62,8 @@ def get_dashboard() -> DashboardResponse:
             ),
             ServiceHealth(
                 name="Knowledge retrieval",
-                status="ready",
-                detail="Tenant-isolated local retrieval is available",
+                status="ready" if knowledge_ready else "attention",
+                detail=knowledge_detail,
             ),
             ServiceHealth(
                 name="Confirmation gate",
@@ -156,6 +150,8 @@ async def upload_knowledge_document(
         )
     except ValueError as exc:
         raise _bad_request(str(exc)) from exc
+    except VectorStoreError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
 
 @router.post("/knowledge/search", response_model=KnowledgeSearchResponse)
@@ -165,3 +161,5 @@ def search_knowledge(payload: KnowledgeSearchRequest) -> KnowledgeSearchResponse
         return get_knowledge_hub().search(payload.tenant_id, payload.query)
     except ValueError as exc:
         raise _bad_request(str(exc)) from exc
+    except VectorStoreError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc

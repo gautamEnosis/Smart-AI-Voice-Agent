@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -33,6 +34,7 @@ from backend.rag.retriever import (
 from backend.rag.vector_store import (
     ChromaVectorStore,
     MemoryVectorStore,
+    VectorStoreError,
     collection_name_for_tenant,
     get_vector_store,
 )
@@ -198,6 +200,70 @@ class TestChromaVectorStore(unittest.TestCase):
         finally:
             store.clear()
 
+    def test_local_hash_retrieval_handles_paraphrases_and_rejects_near_misses(self):
+        """Real Chroma local-hash retrieval must rank relevant facts over hash collisions."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            store = ChromaVectorStore(
+                persist_dir=str(Path(temp_dir) / "chroma_local_hash_eval"),
+                collection_name="local_hash_eval",
+                embedding_function=DefaultLocalEmbeddingFunction(),
+            )
+            store.add_chunks(
+                [
+                    DocumentChunk(
+                        id="spa",
+                        text="The Meridian Wellness Spa opens at 8:00 AM daily.",
+                        metadata={"tenant_id": "grand-meridian", "doc_name": "spa-hours.md"},
+                    ),
+                    DocumentChunk(
+                        id="parking",
+                        text="Valet parking costs 35 dollars per night.",
+                        metadata={"tenant_id": "grand-meridian", "doc_name": "parking.md"},
+                    ),
+                    DocumentChunk(
+                        id="pool",
+                        text="The rooftop pool closes at 10:00 PM each day.",
+                        metadata={"tenant_id": "grand-meridian", "doc_name": "pool.md"},
+                    ),
+                    DocumentChunk(
+                        id="breakfast",
+                        text="Breakfast is included with Deluxe and Suite bookings.",
+                        metadata={"tenant_id": "grand-meridian", "doc_name": "breakfast.md"},
+                    ),
+                ]
+            )
+            retriever = RAGContextRetriever(vector_store=store)
+            answerable_queries = {
+                "What time does the spa open?": "spa-hours.md",
+                "When can I visit the wellness spa?": "spa-hours.md",
+                "How much does overnight valet parking cost?": "parking.md",
+                "What time does the rooftop pool close?": "pool.md",
+                "Which room bookings include breakfast?": "breakfast.md",
+            }
+
+            for query, expected_document in answerable_queries.items():
+                with self.subTest(query=query):
+                    result = retriever.query_with_context(
+                        query,
+                        metadata_filter={"tenant_id": "grand-meridian"},
+                    )
+                    self.assertEqual(result["status"], "matched")
+                    self.assertEqual(result["chunks"][0].metadata["doc_name"], expected_document)
+
+            unsupported_queries = [
+                "Does the spa offer massages for free?",
+                "Does the hotel have a gym that stays open all night?",
+            ]
+            for query in unsupported_queries:
+                with self.subTest(query=query):
+                    result = retriever.query_with_context(
+                        query,
+                        metadata_filter={"tenant_id": "grand-meridian"},
+                    )
+                    self.assertEqual(result["status"], "no_match")
+            store._client = None
+            store._collection = None
+
 
 class TestRAGContextRetriever(unittest.TestCase):
     """Tests for retriever guardrails and spoken formatting."""
@@ -224,15 +290,44 @@ class TestRAGContextRetriever(unittest.TestCase):
     def test_in_scope_retrieval(self):
         """In-scope query retrieves policy context."""
         ctx = self.retriever.query_with_context("What time is check-in and check-out?")
+        self.assertEqual(ctx["status"], "matched")
         self.assertTrue(ctx["has_context"])
         self.assertIn("3:00 PM", ctx["context_prompt"])
         self.assertIn("11:00 AM", ctx["context_prompt"])
         self.assertIn("Never use bullet points", ctx["context_prompt"])
         self.assertIsNone(ctx["fallback_spoken"])
 
+    def test_default_threshold_retrieves_uploaded_fact_with_local_hash_scores(self):
+        """Default settings admit a paraphrased fact scored by the local-first store."""
+        store = MemoryVectorStore()
+        store.add_chunks(
+            [
+                DocumentChunk(
+                    id="spa-hours",
+                    text="The Meridian Wellness Spa opens at 8:00 AM daily.",
+                    metadata={"tenant_id": "grand-meridian", "doc_name": "spa-hours.md"},
+                )
+            ]
+        )
+        retriever = RAGContextRetriever(vector_store=store)
+
+        result = retriever.query_with_context(
+            "What time does the spa open?",
+            metadata_filter={"tenant_id": "grand-meridian"},
+        )
+        self.assertTrue(result["has_context"])
+        self.assertIn("8:00 AM", result["context_prompt"])
+
+        unrelated = retriever.query_with_context(
+            "Can I park my submarine on Mars?",
+            metadata_filter={"tenant_id": "grand-meridian"},
+        )
+        self.assertFalse(unrelated["has_context"])
+
     def test_out_of_scope_fallback(self):
         """Unrelated out-of-scope query delivers graceful spoken fallback."""
         ctx = self.retriever.query_with_context("Can I land my spaceship or submarine in your backyard?")
+        self.assertEqual(ctx["status"], "no_match")
         self.assertFalse(ctx["has_context"])
         self.assertEqual(ctx["context_prompt"], "")
         self.assertEqual(ctx["fallback_spoken"], FALLBACK_SPOKEN_RESPONSE)
@@ -240,6 +335,7 @@ class TestRAGContextRetriever(unittest.TestCase):
     def test_empty_query(self):
         """Empty query returns no context and fallback."""
         ctx = self.retriever.query_with_context("")
+        self.assertEqual(ctx["status"], "no_match")
         self.assertFalse(ctx["has_context"])
         self.assertEqual(ctx["fallback_spoken"], FALLBACK_SPOKEN_RESPONSE)
 
@@ -275,8 +371,8 @@ class TestRAGContextRetriever(unittest.TestCase):
         """Knowledge is merged into the system prompt for the LLM turn."""
         messages = [{"role": "system", "content": "You are Elena."}, {"role": "user", "content": "check-in time"}]
         updated = self.retriever.apply_to_messages(messages, "What time is check-in?")
-        self.assertIn("You are Elena.", updated[0]["content"])
-        self.assertIn("3:00 PM", updated[0]["content"])
+        self.assertEqual(updated[0]["content"], "You are Elena.")
+        self.assertTrue(any("3:00 PM" in message["content"] for message in updated))
 
 
 class TestDocumentIngestionPipeline(unittest.TestCase):
@@ -360,16 +456,47 @@ class TestRAGContextFrameProcessor(unittest.IsolatedAsyncioTestCase):
         retriever = RAGContextRetriever(vector_store=store, similarity_threshold=0.20)
         processor = RAGContextFrameProcessor(retriever=retriever)
 
-        class TranscriptionFrame:
-            def __init__(self, text: str) -> None:
-                self.text = text
-
-        frame = TranscriptionFrame("What time is check-in?")
-        await processor.process_frame(frame)
+        messages = [
+            {"role": "system", "content": "You are Elena."},
+            {"role": "user", "content": "What time is check-in?"},
+        ]
+        result = await processor.prepare_turn(messages, "What time is check-in?")
         self.assertEqual(processor.last_query, "What time is check-in?")
         self.assertIsNotNone(processor.last_result)
         self.assertTrue(processor.last_result["has_context"])
         self.assertIn("3:00 PM", processor.last_result["context_prompt"])
+        self.assertTrue(any("3:00 PM" in message["content"] for message in messages))
+        self.assertEqual(result["status"], "matched")
+
+    async def test_each_turn_replaces_prior_context_and_distinguishes_failure(self):
+        """A no-match or retrieval failure removes old evidence and has an explicit status."""
+        store = MemoryVectorStore()
+        store.add_chunks(
+            [
+                DocumentChunk(
+                    id="spa",
+                    text="The spa opens at 8:00 AM.",
+                    metadata={"tenant_id": "grand-meridian", "doc_name": "spa.md"},
+                )
+            ]
+        )
+        processor = RAGContextFrameProcessor(
+            retriever=RAGContextRetriever(vector_store=store, similarity_threshold=0.1),
+            metadata_filter={"tenant_id": "grand-meridian"},
+        )
+        messages = [{"role": "user", "content": "When does the spa open?"}]
+        await processor.prepare_turn(messages, "When does the spa open?")
+        self.assertIn("8:00 AM", messages[-1]["content"])
+
+        no_match = await processor.prepare_turn(messages, "Tell me about Mars.")
+        self.assertEqual(no_match["status"], "no_match")
+        self.assertNotIn("8:00 AM", messages[-1]["content"])
+
+        processor.retriever.vector_store.search = Mock(side_effect=VectorStoreError("query failed"))
+        unavailable = await processor.prepare_turn(messages, "What are the spa hours?")
+        self.assertEqual(unavailable["status"], "unavailable")
+        self.assertIn("search is unavailable", messages[-1]["content"])
+        self.assertNotIn("8:00 AM", messages[-1]["content"])
 
 
 class TestForceMemoryFactory(unittest.TestCase):
@@ -382,4 +509,3 @@ class TestForceMemoryFactory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

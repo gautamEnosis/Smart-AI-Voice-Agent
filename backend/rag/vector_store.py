@@ -10,9 +10,9 @@ from __future__ import annotations
 import logging
 import math
 import re
-from json import JSONDecodeError, dumps, loads
 from abc import ABC, abstractmethod
 from collections import Counter
+from json import JSONDecodeError, dumps, loads
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -21,6 +21,14 @@ from backend.rag.chunker import DocumentChunk
 from backend.rag.embeddings import DefaultLocalEmbeddingFunction, get_embedding_function
 
 logger = logging.getLogger(__name__)
+
+
+class VectorStoreError(RuntimeError):
+    """Raised when a persistent vector store cannot complete an operation."""
+
+
+class VectorStoreUnavailableError(VectorStoreError):
+    """Raised when the configured persistent vector store is unavailable."""
 
 
 def collection_name_for_tenant(tenant_id: str) -> str:
@@ -64,6 +72,30 @@ class BaseVectorStore(ABC):
     def discard_staged_reindex(self) -> None:
         """Discards an incomplete staged collection after an ingestion failure."""
         return None
+
+
+class UnavailableVectorStore(BaseVectorStore):
+    """Vector-store adapter that reports unavailable storage to live retrieval."""
+
+    def __init__(self, message: str = "Persistent knowledge storage is unavailable.") -> None:
+        self._message = message
+
+    def add_chunks(self, chunks: list[DocumentChunk]) -> int:
+        raise VectorStoreUnavailableError(self._message)
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 2,
+        metadata_filter: dict[str, Any] | None = None,
+    ) -> list[DocumentChunk]:
+        raise VectorStoreUnavailableError(self._message)
+
+    def delete_by_doc(self, doc_name: str) -> int:
+        raise VectorStoreUnavailableError(self._message)
+
+    def clear(self) -> None:
+        raise VectorStoreUnavailableError(self._message)
 
 
 class MemoryVectorStore(BaseVectorStore):
@@ -233,6 +265,9 @@ class MemoryVectorStore(BaseVectorStore):
 class ChromaVectorStore(BaseVectorStore):
     """ChromaDB embedded vector store connector with tenant collections."""
 
+    LOCAL_HASH_MIN_KEYWORD_COVERAGE = 0.40
+    LOCAL_HASH_CANDIDATE_LIMIT = 32
+
     def __init__(
         self,
         persist_dir: str | None = None,
@@ -308,7 +343,7 @@ class ChromaVectorStore(BaseVectorStore):
     def add_chunks(self, chunks: list[DocumentChunk]) -> int:
         target = self._active_write_collection()
         if target is None:
-            return 0
+            raise VectorStoreUnavailableError("ChromaDB is unavailable; document chunks were not indexed.")
         if not chunks:
             return 0
 
@@ -320,11 +355,14 @@ class ChromaVectorStore(BaseVectorStore):
             for c in chunks
         ]
 
-        target.upsert(
-            ids=ids,
-            documents=documents,
-            metadatas=metadatas,
-        )
+        try:
+            target.upsert(
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas,
+            )
+        except Exception as exc:
+            raise VectorStoreError("ChromaDB could not index document chunks.") from exc
         return len(chunks)
 
     def search(
@@ -333,7 +371,9 @@ class ChromaVectorStore(BaseVectorStore):
         top_k: int = 2,
         metadata_filter: dict[str, Any] | None = None,
     ) -> list[DocumentChunk]:
-        if not self.is_available or not query.strip():
+        if not self.is_available:
+            raise VectorStoreUnavailableError("ChromaDB is unavailable; knowledge could not be searched.")
+        if not query.strip():
             return []
 
         where_clause = None
@@ -349,19 +389,28 @@ class ChromaVectorStore(BaseVectorStore):
             "query_texts": [query],
             "n_results": top_k,
         }
+        uses_local_hash = isinstance(self._embedding_function, DefaultLocalEmbeddingFunction)
         if where_clause:
             kwargs["where"] = where_clause
 
         try:
+            if uses_local_hash:
+                collection_count = self._collection.count()
+                if collection_count == 0:
+                    return []
+                kwargs["n_results"] = min(
+                    collection_count,
+                    max(top_k * 10, self.LOCAL_HASH_CANDIDATE_LIMIT),
+                )
             results = self._collection.query(**kwargs)
         except Exception as exc:
-            logger.error("ChromaDB query failed: %s", exc)
-            return []
+            raise VectorStoreError("ChromaDB query failed.") from exc
 
         retrieved: list[DocumentChunk] = []
         if not results or not results.get("ids") or not results["ids"][0]:
             return []
 
+        query_tokens = {self._normalize_keyword(token) for token in MemoryVectorStore._tokenize(query)}
         ids = results["ids"][0]
         docs = results["documents"][0] if results.get("documents") else []
         metas = results["metadatas"][0] if results.get("metadatas") else []
@@ -374,6 +423,15 @@ class ChromaVectorStore(BaseVectorStore):
             dist = distances[i] if i < len(distances) else 1.0
             similarity = round(max(0.0, min(1.0, 1.0 - dist)), 4)
 
+            if uses_local_hash:
+                document_tokens = {
+                    self._normalize_keyword(token)
+                    for token in MemoryVectorStore._tokenize(text)
+                }
+                coverage = len(query_tokens.intersection(document_tokens)) / max(1, len(query_tokens))
+                if coverage < self.LOCAL_HASH_MIN_KEYWORD_COVERAGE:
+                    continue
+                similarity = round((0.75 * coverage) + (0.25 * similarity), 4)
             retrieved.append(
                 DocumentChunk(
                     id=chunk_id,
@@ -383,11 +441,29 @@ class ChromaVectorStore(BaseVectorStore):
                 )
             )
 
-        return retrieved
+        if uses_local_hash:
+            retrieved.sort(key=lambda chunk: chunk.score, reverse=True)
+        return retrieved[:top_k]
+
+    @staticmethod
+    def _normalize_keyword(token: str) -> str:
+        """Normalize common inflections for local-hash lexical reranking."""
+        if len(token) > 5 and token.endswith("ies"):
+            return f"{token[:-3]}y"
+        if len(token) > 5 and token.endswith("ing"):
+            stem = token[:-3]
+            if len(stem) > 2 and stem[-1] == stem[-2]:
+                stem = stem[:-1]
+            return stem
+        if len(token) > 4 and token.endswith("es"):
+            return token[:-2]
+        if len(token) > 3 and token.endswith("s"):
+            return token[:-1]
+        return token
 
     def delete_by_doc(self, doc_name: str) -> int:
         if not self.is_available:
-            return 0
+            raise VectorStoreUnavailableError("ChromaDB is unavailable; document chunks were not deleted.")
         try:
             target = self._active_write_collection()
             existing = target.get(where={"doc_name": doc_name})
@@ -397,8 +473,7 @@ class ChromaVectorStore(BaseVectorStore):
             target.delete(ids=ids)
             return len(ids)
         except Exception as exc:
-            logger.error("ChromaDB delete_by_doc failed: %s", exc)
-            return 0
+            raise VectorStoreError("ChromaDB could not delete document chunks.") from exc
 
     def clear(self) -> None:
         if self.is_available:
@@ -446,7 +521,7 @@ class ChromaVectorStore(BaseVectorStore):
             if staged_name:
                 self._client.delete_collection(name=staged_name)
         except Exception:
-            pass
+            logger.warning("Could not remove incomplete staged Chroma collection %s", staged_name, exc_info=True)
         self._staged_collection = None
         self._staged_collection_name = None
 
