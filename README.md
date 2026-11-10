@@ -128,6 +128,23 @@ start talking (or type). Localhost WebRTC needs no STUN/TURN server.
 
 ---
 
+## Uploaded knowledge
+
+In the Admin Console, open **Knowledge Hub**, upload a PDF, Markdown, or UTF-8
+text file (up to 10 MB), then use **Search tester** to verify a representative
+question retrieves the expected passage. Indexed tenant documents are then
+available to both spoken and typed guest turns. Retrieved passages are treated
+as reference data; live availability and transactional questions continue to
+use their existing tools and confirmation rules.
+
+The backend uses the configured `CHROMA_PERSIST_DIR` and embedding provider.
+ChromaDB must be available on a persistent data volume; if only the
+non-persistent in-memory fallback is available, uploads and voice retrieval are
+disabled and the Admin dashboard reports attention instead of claiming the
+knowledge base is ready. Scanned PDFs requiring OCR are not supported.
+
+---
+
 ## Security behavior and troubleshooting
 
 - Every `/api/v1/admin/*` endpoint requires a bearer token in the `Authorization`

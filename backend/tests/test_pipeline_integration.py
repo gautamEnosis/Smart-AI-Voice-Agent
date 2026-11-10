@@ -20,7 +20,7 @@ import urllib.request
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pipecat.frames.frames import (
     Frame,
@@ -32,10 +32,14 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
+from backend.api.knowledge import KnowledgeHubService
 from backend.api.schemas import ConsumerSessionRequest
 from backend.api.voice_sessions import ConsumerVoiceSessionManager
 from backend.config.settings import AppSettings, load_tenant_config
 from backend.engine.pipeline import create_consumer_voice_pipeline
+from backend.rag.chunker import DocumentChunk
+from backend.rag.retriever import RAGContextRetriever
+from backend.rag.vector_store import MemoryVectorStore
 
 
 class RecordingConnection(SmallWebRTCConnection):
@@ -69,11 +73,16 @@ class ScriptedLLMService(FrameProcessor):
         super().__init__()
         self._reply = reply
         self.run_requests = 0
+        self.observed_contexts: list[list[dict[str, Any]]] = []
 
     async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, (LLMContextFrame, LLMRunFrame)):
             self.run_requests += 1
+            context = getattr(frame, "context", None)
+            messages = getattr(context, "messages", None)
+            if isinstance(messages, list):
+                self.observed_contexts.append([message.copy() for message in messages])
             await self.push_frame(TextFrame(self._reply), direction)
             return
         await self.push_frame(frame, direction)
@@ -208,6 +217,55 @@ class TestLivePipelineStartup(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_pipeline_remains_live_when_persistent_knowledge_store_is_unavailable(self) -> None:
+        """A missing Chroma store degrades retrieval, not the live voice pipeline."""
+        scripted = ScriptedLLMService("I cannot verify that from the uploaded documents.")
+
+        async def scenario() -> None:
+            connection = RecordingConnection()
+            tenant = load_tenant_config()
+            hub = KnowledgeHubService(AppSettings())
+            with patch("backend.api.knowledge.get_vector_store", return_value=MemoryVectorStore()):
+                hub.retriever_for(tenant.tenant_id)
+            with (
+                patch("backend.engine.pipeline.get_knowledge_hub", return_value=hub),
+                patch("backend.engine.pipeline.create_llm_service", return_value=scripted),
+                patch(
+                    "backend.engine.pipeline.create_stt_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+                patch(
+                    "backend.engine.pipeline.create_tts_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+            ):
+                session = await create_consumer_voice_pipeline(
+                    connection=connection,
+                    tenant=tenant,
+                    persona_key="hotel_booking_specialist",
+                    settings=AppSettings(),
+                )
+
+            try:
+                await session.start()
+                await session.inject_user_text("What time is check-in?")
+                await wait_until(lambda: scripted.run_requests >= 1)
+
+                self.assertIsNotNone(session.runner_task)
+                self.assertFalse(session.runner_task.done())
+                evidence = [
+                    message["content"]
+                    for message in scripted.observed_contexts[-1]
+                    if message.get("role") == "developer"
+                    and message.get("content", "").startswith("[Current-turn uploaded knowledge]")
+                ]
+                self.assertEqual(len(evidence), 1)
+                self.assertIn("search is unavailable", evidence[0])
+            finally:
+                await session.stop()
+
+        asyncio.run(scenario())
+
     def test_typed_text_roundtrip_produces_an_agent_caption(self) -> None:
         """6B item 3: typed text enters context and returns as a live caption."""
         scripted = ScriptedLLMService("Our Executive Grand Suite is two hundred sixty dollars per night.")
@@ -258,6 +316,119 @@ class TestLivePipelineStartup(unittest.TestCase):
                 ]
                 self.assertEqual(len(user_messages), 1)
                 self.assertEqual(scripted.run_requests, 1)
+            finally:
+                await session.stop()
+
+        asyncio.run(scenario())
+
+    def test_uploaded_knowledge_reaches_spoken_and_typed_turns_without_stale_context(self) -> None:
+        """Live voice and typed user turns share tenant-scoped, turn-local retrieval."""
+        scripted = ScriptedLLMService("The spa opens at eight in the morning.")
+        store = MemoryVectorStore()
+        store.add_chunks(
+            [
+                DocumentChunk(
+                    id="uploaded-spa-hours",
+                    text="The Meridian Wellness Spa opens at 8:00 AM daily.",
+                    metadata={"doc_name": "spa-hours.md", "tenant_id": "grand-meridian"},
+                ),
+                DocumentChunk(
+                    id="uploaded-tesla-facts",
+                    text="Tesla's headquarters is in Austin, Texas.",
+                    metadata={"doc_name": "tesla-facts.md", "tenant_id": "grand-meridian"},
+                ),
+            ]
+        )
+        store.search = Mock(wraps=store.search)
+        retriever = RAGContextRetriever(vector_store=store, similarity_threshold=0.1)
+
+        async def scenario() -> None:
+            connection = RecordingConnection()
+            tenant = load_tenant_config()
+            with (
+                patch("backend.engine.pipeline.create_llm_service", return_value=scripted),
+                patch(
+                    "backend.engine.pipeline.create_stt_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+                patch(
+                    "backend.engine.pipeline.create_tts_service",
+                    return_value=PassThroughSpeechProcessor(),
+                ),
+            ):
+                session = await create_consumer_voice_pipeline(
+                    connection=connection,
+                    tenant=tenant,
+                    persona_key="hotel_booking_specialist",
+                    settings=AppSettings(),
+                    knowledge_retriever=retriever,
+                )
+
+            try:
+                await session.start()
+                await session.inject_user_text("What time does the spa open?")
+                typed_ready = await wait_until(lambda: scripted.run_requests >= 1)
+                self.assertTrue(typed_ready)
+
+                await session.worker.queue_frames(
+                    [
+                        TranscriptionFrame(
+                            text="When does the spa open?",
+                            user_id="guest-1",
+                            timestamp=datetime.now(UTC).isoformat(),
+                        )
+                    ]
+                )
+                spoken_ready = await wait_until(lambda: scripted.run_requests >= 2)
+                self.assertTrue(spoken_ready)
+
+                await session.inject_user_text("Tell me about Mars.")
+                no_match_ready = await wait_until(lambda: scripted.run_requests >= 3)
+                self.assertTrue(no_match_ready)
+
+                await session.inject_user_text("Where is Tesla's headquarters?")
+                tesla_ready = await wait_until(lambda: scripted.run_requests >= 4)
+                self.assertTrue(tesla_ready)
+
+                self.assertEqual(len(scripted.observed_contexts), 4)
+                self.assertEqual(store.search.call_count, 4)
+                for messages in scripted.observed_contexts[:2]:
+                    evidence = [
+                        message["content"]
+                        for message in messages
+                        if message.get("role") == "developer"
+                        and message.get("content", "").startswith("[Current-turn uploaded knowledge]")
+                    ]
+                    self.assertEqual(len(evidence), 1)
+                    self.assertIn("8:00 AM", evidence[0])
+
+                final_evidence = [
+                    message["content"]
+                    for message in scripted.observed_contexts[2]
+                    if message.get("role") == "developer"
+                    and message.get("content", "").startswith("[Current-turn uploaded knowledge]")
+                ]
+                self.assertEqual(len(final_evidence), 1)
+                self.assertIn("No supporting uploaded-document passage", final_evidence[0])
+                self.assertNotIn("8:00 AM", final_evidence[0])
+
+                tesla_messages = scripted.observed_contexts[3]
+                tesla_evidence = [
+                    message["content"]
+                    for message in tesla_messages
+                    if message.get("role") == "developer"
+                    and message.get("content", "").startswith("[Current-turn uploaded knowledge]")
+                ]
+                self.assertEqual(len(tesla_evidence), 1)
+                self.assertIn("Austin, Texas", tesla_evidence[0])
+                self.assertNotIn("8:00 AM", tesla_evidence[0])
+                system_prompt = next(
+                    message["content"]
+                    for message in tesla_messages
+                    if message.get("role") == "system"
+                )
+                self.assertIn("including topics outside hotel services", system_prompt)
+                self.assertIn("do not decline or redirect", system_prompt)
             finally:
                 await session.stop()
 

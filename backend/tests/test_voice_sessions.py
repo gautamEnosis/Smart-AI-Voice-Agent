@@ -5,22 +5,11 @@ from __future__ import annotations
 import asyncio
 import unittest
 from collections import defaultdict
-from typing import Any, Callable
-from unittest.mock import AsyncMock, MagicMock, patch
+from collections.abc import Callable
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
-from pydantic import TypeAdapter, ValidationError
-
-from backend.api.app import create_app
-from backend.api.schemas import ClientUiEvent, ConsumerSessionRequest, VoiceOfferResponse
-from backend.api.voice_sessions import ConsumerVoiceSession, ConsumerVoiceSessionManager
-from backend.config.settings import AppSettings, load_tenant_config
-from backend.engine.pipeline import (
-    ConsumerVoicePipeline,
-    DataChannelBridgeProcessor,
-    SpeechNormalizerProcessor,
-    emit_generative_ui_events,
-)
 from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     TextFrame,
@@ -28,6 +17,20 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
+from pydantic import TypeAdapter, ValidationError
+
+from backend.api.app import create_app
+from backend.api.schemas import ClientUiEvent, ConsumerSessionRequest, VoiceOfferResponse
+from backend.api.voice_sessions import ConsumerVoiceSession, ConsumerVoiceSessionManager
+from backend.config.settings import AppSettings
+from backend.engine.pipeline import (
+    ConsumerVoicePipeline,
+    DataChannelBridgeProcessor,
+    SpeechNormalizerProcessor,
+    emit_generative_ui_events,
+)
+from backend.rag.retriever import RAGContextFrameProcessor, RAGContextRetriever
+from backend.rag.vector_store import MemoryVectorStore
 
 
 class FakeConnection:
@@ -367,12 +370,9 @@ class TestPipelineEmittersAndProcessors(unittest.TestCase):
     def test_consumer_voice_pipeline_context_injection(self) -> None:
         """Verify ConsumerVoicePipeline.inject_user_text adds message to context and queues LLMRunFrame."""
         # Build a minimal pipeline object without a real transport or worker
-        from pipecat.pipeline.worker import PipelineParams, PipelineWorker
-        from pipecat.workers.runner import WorkerRunner
         from backend.mcp.client import create_mcp_hub
 
         connection = FakeConnection(pc_id="unit-pipeline-test")
-        tenant = load_tenant_config()
 
         async def test_injection() -> None:
             # Build context without transport
@@ -397,6 +397,9 @@ class TestPipelineEmittersAndProcessors(unittest.TestCase):
                 runner=mock_runner,
                 context=context,
                 mcp_hub=mcp_hub,
+                knowledge_processor=RAGContextFrameProcessor(
+                    retriever=RAGContextRetriever(vector_store=MemoryVectorStore())
+                ),
             )
 
             # Test text injection
@@ -411,9 +414,8 @@ class TestPipelineEmittersAndProcessors(unittest.TestCase):
             mock_worker.queue_frames.reset_mock()
             await pipeline_obj.inject_touch_override("R-301", "Executive Grand Suite")
             dev_messages = [m for m in pipeline_obj.context.messages if m.get("role") == "developer"]
-            self.assertEqual(len(dev_messages), 1)
-            self.assertIn("Executive Grand Suite", dev_messages[0]["content"])
-            self.assertIn("verbal confirmation aloud", dev_messages[0]["content"])
+            self.assertIn("Executive Grand Suite", dev_messages[-1]["content"])
+            self.assertIn("verbal confirmation aloud", dev_messages[-1]["content"])
             mock_worker.queue_frames.assert_called_once()
 
         asyncio.run(test_injection())

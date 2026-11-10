@@ -143,11 +143,13 @@ class DocumentIngestionPipeline:
 
         Voice calls continue reading the previous collection until commit.
         """
-        self.vector_store.begin_staged_reindex()
         try:
+            self.vector_store.begin_staged_reindex()
             doc_name = document_id or Path(file_path).stem
             self.vector_store.delete_by_doc(doc_name)
             added = self.ingest_file(file_path, metadata=metadata, document_id=doc_name)
+            if added < 1:
+                raise ValueError(f"No readable text was found in document: {file_path}")
             self.vector_store.commit_staged_reindex()
             return added
         except Exception:
