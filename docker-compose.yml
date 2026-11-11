@@ -25,7 +25,7 @@ services:
     container_name: smart-voice-ollama
     restart: unless-stopped
     ports:
-      - "127.0.0.1:11434:11434"
+      - "127.0.0.1:${OLLAMA_HOST_PORT:-11435}:11434"
     volumes:
       - ollama_models:/root/.ollama
     # Pull the default model on first start.
