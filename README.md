@@ -54,7 +54,7 @@ This starts all four services with health checks and correct wiring
 - Consumer portal → <http://localhost:3000>
 - Admin console → <http://localhost:5173> (sign in with `ADMIN_API_KEY`)
 - API gateway + Swagger docs → <http://localhost:8000/docs>
-- Ollama API → <http://localhost:11434> (bound to localhost only)
+- Ollama API → <http://localhost:11435> (bound to localhost only; configurable with `OLLAMA_HOST_PORT`)
 
 Stop services with `docker compose down`. This keeps stored data; avoid `-v`
 unless you intentionally want to delete the persistent model and application
@@ -182,6 +182,7 @@ Copy `.env.example` → `.env`. All defaults are local-first ($0 compute):
 |---|---|---|
 | `LLM_PROVIDER` | `ollama` | `ollama` \| `gemini` \| `groq` \| `openai` |
 | `OLLAMA_MODEL` / `OLLAMA_BASE_URL` | `llama3.2:3b` / `http://localhost:11434/v1` | Local LLM endpoint |
+| `OLLAMA_HOST_PORT` | `11435` | Host port for the Compose Ollama API; change if this port is already in use |
 | `STT_PROVIDER` | `faster_whisper` | Speech-to-text backend |
 | `TTS_PROVIDER` | `kokoro` | Text-to-speech backend |
 | `ADMIN_API_KEY` | *(unset; required for admin access)* | Secret bearer key used by the Admin Console |
