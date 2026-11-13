@@ -1,12 +1,7 @@
 import type {
   DashboardResponse,
-  GroundingMode,
   KnowledgeDocument,
-  KnowledgeDocumentScope,
   KnowledgeSearchResult,
-  PersonaKnowledgeSettings,
-  PersonaVoiceUpdate,
-  PersonaVoiceUpdateResponse,
   ProviderSettingsResponse,
   RuntimeProviderConfig,
   VoiceProfile,
@@ -75,58 +70,17 @@ export const adminApi = {
   updateProviderSettings: (payload: RuntimeProviderConfig): Promise<ProviderSettingsResponse> =>
     request('/api/v1/admin/providers', { method: 'PUT', body: JSON.stringify(payload) }),
   getVoices: (): Promise<VoiceProfile[]> => request('/api/v1/admin/voices'),
-  updatePersonaVoice: (personaKey: string, payload: PersonaVoiceUpdate): Promise<PersonaVoiceUpdateResponse> =>
-    request(`/api/v1/admin/personas/${encodeURIComponent(personaKey)}/voice`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
   getKnowledgeDocuments: (): Promise<KnowledgeDocument[]> => request('/api/v1/admin/knowledge/documents'),
-  uploadKnowledgeDocument: (
-    input: File | { file: File; scope?: KnowledgeDocumentScope; assigned_personas?: string[] },
-  ): Promise<KnowledgeDocument> => {
-    const file = input instanceof File ? input : input.file;
+  uploadKnowledgeDocument: (file: File): Promise<KnowledgeDocument> => {
     const body = new FormData();
     body.append('document', file);
     body.append('tenant_id', 'grand-meridian');
-    body.append('scope', input instanceof File ? 'tenant_wide' : (input.scope ?? 'tenant_wide'));
-    const assignedPersonas = input instanceof File ? [] : input.assigned_personas ?? [];
-    assignedPersonas.forEach((persona) => body.append('assigned_personas', persona));
     return request('/api/v1/admin/knowledge/upload', { method: 'POST', body });
   },
-  updateDocumentAssignments: (
-    documentId: string,
-    payload: { scope: KnowledgeDocumentScope; assigned_personas: string[] },
-  ): Promise<KnowledgeDocument> =>
-    request(`/api/v1/admin/knowledge/documents/${encodeURIComponent(documentId)}/assignments`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    }),
-  toggleDocumentStatus: (documentId: string, payload: { is_enabled: boolean }): Promise<KnowledgeDocument> =>
-    request(`/api/v1/admin/knowledge/documents/${encodeURIComponent(documentId)}/status`, {
-      method: 'PATCH',
-      body: JSON.stringify(payload),
-    }),
-  deleteKnowledgeDocument: (documentId: string): Promise<{ deleted: boolean }> =>
-    request(`/api/v1/admin/knowledge/documents/${encodeURIComponent(documentId)}`, { method: 'DELETE' }),
-  searchKnowledge: (query: string, persona_key?: string): Promise<KnowledgeSearchResult> =>
+  searchKnowledge: (query: string): Promise<KnowledgeSearchResult> =>
     request('/api/v1/admin/knowledge/search', {
       method: 'POST',
-      body: JSON.stringify({ query, tenant_id: 'grand-meridian', persona_key: persona_key ?? null }),
-    }),
-  getPersonaKnowledgeSettings: (personaKey: string): Promise<PersonaKnowledgeSettings> =>
-    request(`/api/v1/admin/knowledge/personas/${encodeURIComponent(personaKey)}/settings?tenant_id=grand-meridian`),
-  updatePersonaKnowledgeSettings: (
-    personaKey: string,
-    payload: {
-      grounding_mode: GroundingMode;
-      min_relevance_score: number;
-      max_chunks_per_turn: number;
-      custom_fallback_spoken?: string | null;
-    },
-  ): Promise<PersonaKnowledgeSettings> =>
-    request(`/api/v1/admin/knowledge/personas/${encodeURIComponent(personaKey)}/settings?tenant_id=grand-meridian`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ query, tenant_id: 'grand-meridian' }),
     }),
   auditionVoice: async (payload: { voice_id: string; text: string; speed: number; pitch: number }): Promise<Blob> => {
     const response = await fetchAdminApi('/api/v1/admin/voice/audition', {

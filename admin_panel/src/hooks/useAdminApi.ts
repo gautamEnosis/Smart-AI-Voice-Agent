@@ -64,7 +64,7 @@ export function useUploadKnowledgeDocument() {
 
 /** Executes an explicit knowledge search test when an operator submits it. */
 export function useKnowledgeSearch() {
-  return useMutation({ mutationFn: adminApi.searchKnowledge });
+  return useMutation({ mutationFn: (query: string) => adminApi.searchKnowledge(query) });
 }
 
 /** Synthesizes an audio preview for the selected Voice Studio profile. */
